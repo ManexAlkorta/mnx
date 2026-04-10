@@ -1,0 +1,9 @@
+build/
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*/*/*/__pycache__/
+
+Tutorial/.ipynb_checkpoints/
+mnx.egg-info/
+src/mnx.egg-info/
