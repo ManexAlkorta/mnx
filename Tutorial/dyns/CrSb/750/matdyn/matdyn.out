@@ -1,0 +1,36 @@
+
+     Program MATDYN v.7.5 starts on 10Feb2026 at 15:21:33 
+
+     This program is part of the open-source Quantum ESPRESSO suite
+     for quantum simulation of materials; please cite
+         "P. Giannozzi et al., J. Phys.:Condens. Matter 21 395502 (2009);
+         "P. Giannozzi et al., J. Phys.:Condens. Matter 29 465901 (2017);
+         "P. Giannozzi et al., J. Chem. Phys. 152 154105 (2020);
+          URL http://www.quantum-espresso.org", 
+     in publications or presentations arising from this work. More details at
+     http://www.quantum-espresso.org/quote
+
+     Parallel version (MPI), running on     1 processors
+
+     MPI processes distributed on     1 nodes
+     8093 MiB available memory on the printing compute node when the environment starts
+
+ mass for atomic type   1 not given; uses mass from file dyn.fc                                                                                                                                                                                                                                                          
+ mass for atomic type   2 not given; uses mass from file dyn.fc                                                                                                                                                                                                                                                          
+ Norm of the difference between old and new effective charges:    0.00000000000000000000
+
+ Norm of the difference between old and new force-constants:   0.00000000003505055748
+
+     Message from routine matdyn:
+     Z* not found in file dyn.fc, TO-LO splitting at q=0 will be absent!
+     Message from routine matdyn:
+     Z* not found in file dyn.fc, TO-LO splitting at q=0 will be absent!
+
+     MATDYN       :      0.25s CPU      5.53s WALL
+
+
+   This run was terminated on:  15:21:38  10Feb2026            
+
+=------------------------------------------------------------------------------=
+   JOB DONE.
+=------------------------------------------------------------------------------=
