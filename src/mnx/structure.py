@@ -40,18 +40,18 @@ class Structure:
             i = 0
             while data[i][:15] != "CELL_PARAMETERS":
                 i += 1
-            instance.cell_units = data[i].split()[-1]
             i += 1
             for j in range(3):
                 for k in range(3):
                     instance.cell[j, k] = float((data[i + j].split())[k])
             i += 3
             instance.rcell = _cell.get_rcell(instance.cell)
-            while data[i][:16] != "ATOMIC_POSITIONS":
+            while data[i][:16] != "ATOMIC_POSITIONS": # IN crystal units!!!!
                 i += 1
             i += 1
             instance.Natoms = len(data) - i 
             instance.atom_species = np.empty([instance.Natoms, 2], dtype="<U5")
+            atom_coords_cryst = np.empty([instance.Natoms, 3], dtype=float)
             instance.atom_coords = np.empty([instance.Natoms, 3], dtype=float)
             tmp_id = 0
             for j in range(i, instance.Natoms + i):
@@ -66,7 +66,8 @@ class Structure:
                     instance.atom_species[atom, 0]
                 ]
                 for k in range(3):
-                    instance.atom_coords[atom, k] = (data[j].split())[k + 1]
+                    atom_coords_cryst[atom, k] = (data[j].split())[k + 1]
+                instance.atom_coords[atom, :] = _cell.cryst2cart(atom_coords_cryst[atom,:],instance.cell)
             instance._atomic_dict = atomic_species_dict
             instance.Nspecies = tmp_id            
         elif format == "vasp":
@@ -244,7 +245,12 @@ class Structure:
             fmt_cell = "{0:18.9f}{1:18.9f}{2:18.9f}\n"
             fmt_atom_struct = "{0:>10}{1:18.9f}{2:18.9f}{3:18.9f}\n"
             file = open(file, "w")
-            file.write("ATOMIC_POSITIONS {crystal}\n")
+            file.write("CELL_PARAMETERS {" + "angstroms" + "}\n")
+            for k in range(3):
+                file.write(
+                    fmt_cell.format(self.cell[k, 0], self.cell[k, 1], self.cell[k, 2])
+                )
+            file.write("\nATOMIC_POSITIONS {crystal}\n")
             atom_coords_crystal = _cell.cart2cryst(self.atom_coords, self.cell)
             for atom in range(self.Natoms):
                 file.write(
@@ -255,11 +261,7 @@ class Structure:
                         atom_coords_crystal[atom, 2],
                     )
                 )
-            file.write("\nCELL_PARAMETERS {" + self.cell_units + "}\n")
-            for k in range(3):
-                file.write(
-                    fmt_cell.format(self.cell[k, 0], self.cell[k, 1], self.cell[k, 2])
-                )
+
         elif format == "vasp":
             fmt_chemical_species = "{0:>4}"
             fmt_cell = "{0:18.9f}{1:18.9f}{2:18.9f}\n"
