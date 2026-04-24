@@ -69,7 +69,8 @@ class Structure:
                     atom_coords_cryst[atom, k] = (data[j].split())[k + 1]
                 instance.atom_coords[atom, :] = _cell.cryst2cart(atom_coords_cryst[atom,:],instance.cell)
             instance._atomic_dict = atomic_species_dict
-            instance.Nspecies = tmp_id            
+            instance.Nspecies = tmp_id
+            #instance._fix_coords()       
         elif format == "vasp":
             #Still testing
             tmp_ase_struct = ase.io.read(file,format="vasp")
@@ -82,6 +83,7 @@ class Structure:
             tmp_atom_coords = np.empty([instance.Natoms, 3])
             tmp_cell = np.empty([3, 3])
             instance.masses = np.empty([instance.Natoms])
+            instance._exp_masses = np.empty([instance.Natoms,3])
             atomic_species_dict = {}
             atomic_masses_dict = {}
             tmp_atom_species = np.empty([instance.Natoms, 2], dtype="<U5")
@@ -103,10 +105,11 @@ class Structure:
                 pos = val_list.index(tmp_atom_species[atom, 1])
                 tmp_atom_species[atom, 0] = key_list[pos]
                 instance.masses[atom] = atomic_masses_dict[tmp_atom_species[atom, 1]]
+                instance._exp_masses[atom,:] = instance.masses[atom]
             instance._atomic_dict = atomic_species_dict
             instance.atom_coords = tmp_atom_coords * alat
             instance._set_atom_species(tmp_atom_species)
-            instance._fix_coords()
+            #instance._fix_coords()
         return instance
             
     @classmethod
@@ -144,7 +147,7 @@ class Structure:
                 list_species.append(instance.atom_species[a, 0])
         instance.Nspecies = len(list_species)
         instance.rcell = _cell.get_rcell(instance.cell)
-        instance._fix_coords()
+        #instance._fix_coords()
         return instance
 
     @classmethod
@@ -170,7 +173,14 @@ class Structure:
         instance.rcell = _cell.get_rcell(instance.cell)
         instance.atom_coords = atom_coords
         instance._set_atom_species(atom_species)
-        instance._fix_coords()
+        #instance._fix_coords()
+        atomic_species_dict, k = {}, 1
+        _included = []
+        for i,symbol in enumerate(instance.atom_species[:,0]):
+            if symbol not in _included:
+                _included.append(symbol)
+            atomic_species_dict[symbol] = instance.atom_species[i, 1]
+        instance._atomic_dict = atomic_species_dict
         return instance
 
     def info(self) -> None:
@@ -396,7 +406,7 @@ class Structure:
             total_rel_pos -= rel_pos
         self.atom_coords += total_rel_pos / len(R)
 
-    def to_primitive(self, symprec: float = 1e-5, rotate : bool = True) -> "Structure":
+    def get_primitive(self, symprec: float = 1e-5, rotate : bool = True) -> "Structure":
         """
         This function converts the Structure object into a primitve cell detected by Spglib
         with the precision given by symprec. The cell is by default rotated to the definitions
@@ -423,7 +433,7 @@ class Structure:
         Natoms = frac_coords.shape[0]
         atom_species = np.empty([Natoms,2], dtype="<U5")
         for atom in range(Natoms):
-            atom_species[atom,0] = next((k for k, v in self._atomic_dict.items() if v == ids[atom]), None)
+            atom_species[atom,0] = self.atom_species[np.where(self.atom_species[:,1] == f"{ids[atom]}")[0][0],0]
             atom_species[atom,1] = ids[atom]
         tmp_structure = Structure.from_data(lattice, _cell.cryst2cart(frac_coords, lattice), atom_species)
         return tmp_structure

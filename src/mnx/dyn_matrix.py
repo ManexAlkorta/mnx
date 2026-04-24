@@ -179,7 +179,6 @@ class DynMatrix:
             polvecs_instar = np.empty([self.DynQs[index[0]].Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
             displacements_instar = np.empty([self.DynQs[index[0]].Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
             for qi,q in enumerate(self.DynQs[index[0]].qpoints):
-                q = _cell.cryst2cart(q, self.structure.rcell)
                 for i in range(mod[0]):
                     for j in range(mod[1]):
                         for k in range(mod[2]):
@@ -193,8 +192,7 @@ class DynMatrix:
                             ] = self.DynQs[index[0]].polvecs[qi, index[1]] * np.exp(
                                 2j
                                 * np.pi
-                                * np.matmul(
-                                    _cell.cart2cryst(q, self.structure.rcell),
+                                * np.matmul(q,
                                     np.array([i, j, k]),
                                 )
                             )
@@ -256,7 +254,7 @@ class DynMatrix:
         dynq = DynQ.from_data(self.structure, np.array([q]), np.array([phiq]), np.array([frequencies]), np.array([np.transpose(polvecs)]))
         return dynq
     
-    def get_bands(self, k_inpath : np.ndarray, N : int) -> tuple[np.ndarray, np.ndarray, list]:
+    def get_bands(self, k_inpath : np.ndarray, N : int, gauge: str="atomic") -> tuple[np.ndarray, np.ndarray, list]:
         """
         Function to complute the phonon spectra in a fine grid.
         
@@ -268,6 +266,10 @@ class DynMatrix:
                 GMA path in a hexagonal unit cell.
             N : int
                 Number k-points in each of the segments defined in k_inpath.
+            gauge : str. Defaults to "atomic".
+                Gauge employed for the fourier interpolation.
+                Supported options: "atomic" and "lattice".
+
         Returns
         -------
             bands : np.ndarray. [Nqpoints, Nmodes].
@@ -280,7 +282,57 @@ class DynMatrix:
         """
         k_inpath = np.asarray(k_inpath)
         qpath=np.empty([len(k_inpath)*(N+1),3])
-        bands = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=complex)
+        bands = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=np.float64)
+        cart_qpath = np.zeros(len(k_inpath)*(N+1))
+        xticks = [0]
+        for ki,ks in enumerate(k_inpath):
+            dk = (ks[1]-ks[0])
+            cart_qpath[ki*(N+1):(ki+1)*(N+1)] = cart_qpath[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell))*np.arange(0,10+10/N,10/N)
+            xticks.append(cart_qpath[(ki+1)*(N+1)-1])
+            dk = dk
+            qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]
+        for qi,q in enumerate(qpath):
+            dynq = self.get_dynq(q, gauge)
+            bands[qi] = np.real(dynq.frequencies[0])
+            _looking = True
+            for mode in range(len(bands[0,:])):
+                if _looking:
+                    if np.square(dynq.frequencies[0,mode]).min()<0:
+                        bands[qi,mode] = np.real((-1)*np.sqrt(np.abs(np.square(dynq.frequencies[0,mode]))))
+                    else:
+                        _looking = False
+        return bands, cart_qpath, xticks
+    
+    def get_bands_with_SF(self, k_inpath : np.ndarray, N : int, Q : list) -> tuple[np.ndarray, np.ndarray, list,  np.ndarray]:
+        """
+        Function to complute the phonon spectra in a fine grid, returning the structure factor calculated
+        in the path Q+k.
+        
+        Parameters
+        ----------
+            k_inpath : np.ndarray
+                k-points in fractional units, orginized in pairs defining paths.
+                Example: np.array([[0,0,0],[0.5,0,0]],[[0.5,0,0],[0.5,0,0.5]]) corresponds to a
+                GMA path in a hexagonal unit cell.
+            N : int
+                Number k-points in each of the segments defined in k_inpath.
+            Q : list of floats.
+                The Q point in fractional units.
+        Returns
+        -------
+            bands : np.ndarray. [Nqpoints, Nmodes].
+                Frequency of the vibrational modes in the q-path. Units cm^{-1}.
+            cart_qpath : np.ndarray.
+                Distance between respective q-points in cartesian units for a physical and straightforward
+                visualization. 
+            xticks : list.
+                The values of cart_qpath, where the segements defined in k_inpath start/end.
+            structure_factor : np.ndarray. [Nqpoints, Nmodes]
+        """
+        k_inpath = np.asarray(k_inpath)
+        qpath=np.empty([len(k_inpath)*(N+1),3])
+        bands = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=np.float64)
+        structure_factor = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=np.float64)
         cart_qpath = np.zeros(len(k_inpath)*(N+1))
         xticks = [0]
         for ki,ks in enumerate(k_inpath):
@@ -291,9 +343,23 @@ class DynMatrix:
             qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]
         for qi,q in enumerate(qpath):
             dynq = self.get_dynq(q)
+            bands[qi] = np.real(dynq.frequencies[0])
+            _looking = True
+            for mode in range(len(bands[0,:])):
+                if _looking:
+                    if np.square(dynq.frequencies[0,mode]).min()<0:
+                        bands[qi,mode] = np.real((-1)*np.sqrt(np.abs(np.square(dynq.frequencies[0,mode]))))
+                    else:
+                        _looking = False
             for mode in range(self.structure.Natoms*3):
-                bands[qi] = dynq.frequencies[0]
-        return bands, cart_qpath, xticks
+                eps = np.reshape(dynq.displacements[0, mode, :], [self.structure.Natoms, 3])
+                eps1 = np.empty([self.structure.Natoms, 3], dtype=complex)        
+                for atom in range(self.structure.Natoms):
+                    phase = np.exp(2j*np.pi*np.matmul(np.array(_cell.cryst2cart(np.array(q+Q), self.structure.rcell)), self.structure.atom_coords[atom, :]))
+                    eps1[atom, :] = eps[atom, :]*phase
+                s = (np.sum(np.matmul(np.sqrt(2*self.structure._exp_masses)*eps1, np.array(_cell.cryst2cart(np.array(q+Q), self.structure.rcell))), axis=0))
+                structure_factor[qi,mode] = np.real(1/dynq.frequencies[0,mode]*np.conjugate(s)*s)
+        return bands, cart_qpath, xticks, structure_factor
     
     def Symmetrize(self, symprec : float = 1e-5, apply_translations : bool = True) -> None:
         """
@@ -665,7 +731,7 @@ class DynQ:
         for i, n in enumerate(order):
             frequencies[i] = tmp_frequencies[n]
             polvecs[i] = tmp_polvecs[n]
-            displacements[i] = displacements[n]
+            displacements[i] = tmp_displacements[n]
         return frequencies, polvecs, displacements
     
     def copy(self) -> "DynQ":
