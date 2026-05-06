@@ -7,6 +7,7 @@ import symph
 
 import numpy as np
 import spglib
+import phonopy
 import copy
 
 from .structure import Structure
@@ -42,11 +43,11 @@ class DynMatrix:
         DynMatrix : object
             An instance with the class containing the phonon spectra.
         """
-        instance = cls()   
-        instance.file = file
+        instance = cls()
         instance.Nqirr = Nqirr
         if instance.Nqirr == 0:
             instance.structure = Structure.from_file(file, format="dyn")
+            instance.qgrid = qgrid
         else:
             instance.qgrid = qgrid
             instance.structure = Structure.from_file(f"{file}1", format="dyn")
@@ -55,21 +56,77 @@ class DynMatrix:
             instance.DynQs = np.empty([1], dtype=object)
             instance.qstars = np.empty([1], dtype=object)
 
-            instance.DynQs = DynQ.from_file(instance.file)
+            instance.DynQs = DynQ.from_file(file)
             instance.qstars[0] =instance.DynQs[0].qpoints
             instance.Nqpoints = instance.DynQs[qs].Nqinstar
         else:
             instance.DynQs = np.empty([instance.Nqirr], dtype=object)
             instance.qstars = np.empty([instance.Nqirr], dtype=object)
             for qirr in range(instance.Nqirr):
-                instance.DynQs[qirr] = DynQ.from_file(f"{instance.file}{qirr+1}")
+                instance.DynQs[qirr] = DynQ.from_file(f"{file}{qirr+1}")
                 instance.qstars[qirr] = instance.DynQs[qirr].qpoints
             instance.Nqpoints = 0
             for qs in range(instance.Nqirr):
                 instance.Nqpoints += instance.DynQs[qs].Nqinstar
             instance.get_phiR()
         instance._alat = instance.DynQs[0]._alat
+        return(instance)
+
+    @classmethod
+    def from_phonopy(cls, folder: str, qgrid: list) -> "DynMatrix": 
+        """
+        Classmethod of DynMatrix. Reads the force constants and structure info from the folder in which
+        a VASP-phonopy calculation was previously performed. The primitive structure needs to be named
+        primPOSCAR.
+
+        Parameters
+        ----------
+        folder : str.
+            Path to folder the VASP-phonopy calculation folder.
+        qgrid : list or np.ndarray
+            qgrid where the phonon spectra is computed.
+
+        Returns
+        -------
+        DynMatrix : object
+            An instance with the class containing the phonon spectra.
+        """
+        instance = cls()
+        instance.Nqirr = qgrid[0]*qgrid[1]*qgrid[2]
         instance.qgrid = qgrid
+        instance.structure = Structure.from_file(f"{folder}/primPOSCAR", format="vasp")
+        instance._alat = np.linalg.norm(instance.structure.cell[0,:])
+
+        instance.super_structure = instance.structure.expand_structure(instance.qgrid)
+
+        _phonon = phonopy.load(f"{folder}/phonopy.yaml")
+        instance.structure.masses = _phonon.masses / _consts.Ry2AMU
+        instance.DynQs = np.empty([instance.Nqirr], dtype=object)
+        instance.qstars = np.empty([instance.Nqirr], dtype=object)
+        for qx in range(instance.qgrid[0]):
+            for qy in range(instance.qgrid[1]):
+                for qz in range(instance.qgrid[2]):
+                    _qx, _qy, _qz = qx/instance.qgrid[0], qy/instance.qgrid[1], qz/instance.qgrid[2]
+                    if qx == 0 and qy == 0 and qz == 0:
+                        _qpoints = [[_qx, _qy, _qz]]
+                    else:
+                        _qpoints.append([_qx, _qy, _qz])
+        instance.Nqpoints = len(_qpoints)
+        _dynqs = np.empty([instance.Nqirr, instance.structure.Natoms, instance.structure.Natoms, 3, 3], dtype=complex)
+        for qi, q in enumerate(_qpoints):
+            dynq = np.reshape(_phonon.get_dynamical_matrix_at_q(q), [instance.structure.Natoms, 3, instance.structure.Natoms, 3]) * _consts.eVA2RyBohr2 * _consts.Ry2AMU
+            dynq = np.moveaxis(dynq, [1], [2])
+            _dynqs[qi] = dynq
+            instance.qstars[qi] = np.asarray([q])
+        _phiqs = np.empty(_dynqs.shape, dtype=complex)
+        for qi, q in enumerate(_qpoints):
+            for i in range(instance.structure.Natoms):
+                for j in range(instance.structure.Natoms):
+                    _phiqs[qi, i, j, :, :] = _dynqs[qi, i, j, :, :] * np.sqrt(instance.structure.masses[i] * instance.structure.masses[j])
+        instance.phiR = np.real(mnx.FModules.interpolation.ift_fcq(_phiqs,_qpoints,instance.structure.cell,instance.super_structure.atom_coords,"atomic"))
+        for qi,q in enumerate(_qpoints):
+            instance.DynQs[qi] = instance.get_dynq(q, gauge="lattice")
+        
         return(instance)
 
     def distort_structure(self, Q : list, modes : list, mod : list=None) -> "Structure":
@@ -567,7 +624,7 @@ class DynQ:
             if data[i].split()[0] == "q":
                 instance.Nqinstar += 1
         instance.qpoints = np.empty([instance.Nqinstar, 3], dtype=float)
-        instance.qpoints_alat = np.empty([instance.Nqinstar, 3], dtype=float)
+        instance.qpoints_cart = np.empty([instance.Nqinstar, 3], dtype=float)
         i = 3
         instance.phiqs = np.empty(
             [instance.Nqinstar, instance.structure.Natoms, instance.structure.Natoms, 3, 3], dtype=complex
@@ -575,9 +632,9 @@ class DynQ:
         for q_index in range(instance.Nqinstar):
             while (data[i][:]).split()[0] != "q":
                 i += 1
-            instance.qpoints[q_index] = np.array([(data[i][:]).split()[3:6]])
-            instance.qpoints[q_index] = _cell.cart2cryst(instance.qpoints[q_index], instance.structure.rcell)
-            instance.qpoints_alat[q_index] = instance.qpoints[q_index]/instance._alat
+            instance.qpoints_cart[q_index] = np.array([(data[i][:]).split()[3:6]])
+            instance.qpoints_cart[q_index] = instance.qpoints_cart[q_index]/instance._alat
+            instance.qpoints[q_index] = _cell.cart2cryst(instance.qpoints_cart[q_index]*instance._alat, instance.structure.rcell)
             i += 2
             for n1 in range(instance.structure.Natoms):
                 for n2 in range(instance.structure.Natoms):
@@ -630,9 +687,13 @@ class DynQ:
                 to the combined a:atom, alpha:cart_index superindex.
         """
         instance = cls()
-        instance.structure = structure
+        instance.structure = structure        
+        instance._alat = np.linalg.norm(instance.structure.cell[0,:])
         instance.qpoints = qpoints
         instance.Nqinstar = qpoints.shape[0]
+        instance.qpoints_cart = np.empty([instance.Nqinstar, 3], dtype=float)
+        for q_index in range(instance.Nqinstar):
+            instance.qpoints_cart[q_index] = _cell.cryst2cart(instance.qpoints[q_index], instance.structure.rcell)
         instance.phiqs = phiqs
         instance.dynqs = instance._phis2dyns()
         instance.polvecs = np.empty([instance.Nqinstar,instance.structure.Natoms*3,instance.structure.Natoms*3], dtype=np.complex128)
@@ -800,9 +861,9 @@ class DynQ:
         for qi in range(self.Nqinstar):
             file.write("\n     Dynamical  Matrix in cartesian axes\n\n")
             file.write("     q = ( {0:14.9f}{1:14.9f}{2:14.9f} )\n\n".format(
-                self.qpoints_alat[qi, 0]*norm,
-                self.qpoints_alat[qi, 1]*norm,
-                self.qpoints_alat[qi, 2]*norm
+                self.qpoints_cart[qi, 0]*norm,
+                self.qpoints_cart[qi, 1]*norm,
+                self.qpoints_cart[qi, 2]*norm
             ))
             for i in range(self.structure.Natoms):
                 for j in range(self.structure.Natoms):
@@ -819,9 +880,9 @@ class DynQ:
                         ))
         file.write("\n     Diagonalizing the dynamical matrix\n\n")
         file.write("     q = ( {0:14.9f}{1:14.9f}{2:14.9f} )\n\n".format(
-                self.qpoints_alat[0, 0]*norm, 
-                self.qpoints_alat[0, 1]*norm,
-                self.qpoints_alat[0, 2]*norm
+                self.qpoints_cart[0, 0]*norm, 
+                self.qpoints_cart[0, 1]*norm,
+                self.qpoints_cart[0, 2]*norm
             ))
         file.write(" **************************************************************************\n")
         for mode in range(self.structure.Natoms*3):

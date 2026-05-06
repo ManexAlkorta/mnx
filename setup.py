@@ -54,6 +54,7 @@ setup(
         "numpy",
         "spglib",
         "ase",
+        "phonopy",
         "PyQt5", #Interactive plots.
     ],
     python_requires='>=3.6',

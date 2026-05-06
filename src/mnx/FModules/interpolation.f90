@@ -30,9 +30,12 @@ contains
                 if (gauge == "lattice") then
                     call cart2cryst( &
 super_atom_coords((b-1)/prim_natoms*prim_natoms+1,:)-super_atom_coords((a-1)/prim_natoms*prim_natoms+1,:), prim_cell, R)
+                else if (gauge == "atomic") then
+                    call cart2cryst( &  
+super_atom_coords(b,:)-super_atom_coords(a,:), prim_cell, R)
                 end if
                 do qi = 1, Nqpoint
-                    phase = exp(2*j*pi*dot_product(qs(qi,:),R))
+                    phase = exp(-2*j*pi*dot_product(qs(qi,:),R))
                     phiR(a,b,:,:) = phiR(a,b,:,:) + real(phiqs(qi,mod(a-1,prim_natoms)+1,mod(b-1,prim_natoms)+1,:,:)*phase)
                 end do
             end do
@@ -106,13 +109,13 @@ phiq, frequencies, polvecs, prim_natoms, super_natoms)
                             ! Found a new strictly shorter distance
                             min_dist = dist
                             n_equiv = 1
-                            equiv_phases(1) = exp(-2*j*pi*dot_product(q, R_test))
+                            equiv_phases(1) = exp(2*j*pi*dot_product(q, R_test))
                         
                         else if (abs(dist - min_dist) < 1.0d-5) then
                             ! Found another equidistant point (boundary of Wigner-Seitz)
                             if (n_equiv < 8) then
                                 n_equiv = n_equiv + 1
-                                equiv_phases(n_equiv) = exp(-2*j*pi*dot_product(q, R_test))
+                                equiv_phases(n_equiv) = exp(2*j*pi*dot_product(q, R_test))
                             end if
                         end if
                     end do
