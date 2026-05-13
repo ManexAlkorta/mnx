@@ -1,6 +1,6 @@
 # mnx
 
-***mnx*** is a code to handle crystallographic structures and dynamical matrixes. At the moment it is implemented to work with ***QuantumESPRESSO*** and ***VASP*** formats, also supporting the ***SSCHA*** code.
+***mnx*** is a code to handle crystallographic structures and dynamical matrixes. At the moment it is implemented to work with ***QuantumESPRESSO*** and ***VASP-PHONOPY*** formats, also supporting the ***SSCHA*** code.
 
 ## Installation
 
