@@ -46,7 +46,7 @@ py.extension_module(
 )
 
 # =============================================================================
-# 3. Extension Module: symph (Using Strict Visibility .pyf)
+# 3. Extension Module: symph
 # =============================================================================
 qe_path = 'src/mnx/FModules/QE/'
 symph_filenames = [
@@ -67,7 +67,8 @@ foreach f : symph_filenames
   symph_sources += qe_path + f
 endforeach
 
-pyf_blueprint = files('symph.pyf')
+# Point Meson to look for the signature file directly in the QE directory
+pyf_blueprint = files(qe_path + 'symph.pyf')
 
 symph_gen = custom_target(
   'symph_f2py',

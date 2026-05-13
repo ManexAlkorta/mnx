@@ -1,0 +1,30 @@
+python module symph
+    interface
+        subroutine trans_v2(v2, tau_sc_latvec, nat_sc, nr)
+            integer intent(hide), depend(v2) :: nat_sc = shape(v2, 2)
+            integer intent(hide), depend(tau_sc_latvec) :: nr = shape(tau_sc_latvec, 1)
+            double precision dimension(3, 3, nat_sc, nat_sc), intent(inout) :: v2
+            integer dimension(nat_sc, nr), intent(in) :: tau_sc_latvec
+        end subroutine trans_v2
+
+        subroutine sym_v2(v2, at_sc, bg_sc, s, irt, nsym, nat_sc)
+            integer intent(hide), depend(v2) :: nat_sc = shape(v2, 2)
+            double precision dimension(3, 3, nat_sc, nat_sc), intent(inout) :: v2
+            double precision dimension(3, 3), intent(in) :: at_sc
+            double precision dimension(3, 3), intent(in) :: bg_sc
+            integer dimension(3, 3, 48), intent(in) :: s
+            integer dimension(48, nat_sc), intent(in) :: irt
+            integer intent(in) :: nsym
+        end subroutine sym_v2
+
+        subroutine get_latvec(tau_sc, tau, itau, latvec, nat, nat_sc, nr)
+            integer intent(hide), depend(tau_sc) :: nat_sc = shape(tau_sc, 1)
+            integer intent(hide), depend(tau) :: nat = shape(tau, 1)
+            integer intent(hide), depend(latvec) :: nr = shape(latvec, 0)
+            double precision dimension(3, nat_sc), intent(in) :: tau_sc
+            double precision dimension(3, nat), intent(in) :: tau
+            integer dimension(nat_sc), intent(in) :: itau
+            double precision dimension(nr, 3), intent(out) :: latvec
+        end subroutine get_latvec
+    end interface
+end python module symph
