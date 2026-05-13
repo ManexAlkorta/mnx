@@ -1,0 +1,25 @@
+[build-system]
+requires = [
+    "meson-python",
+    "numpy",
+]
+build-backend = "mesonpy"
+
+[project]
+name = "mnx"
+version = "0.1.0"
+description = "Phonon tools with Fortran backend"
+readme = "README.md"
+requires-python = ">=3.8"
+
+authors = [
+  {name="Manex Alkorta Lopetegi", email="manexalk@gmail.com"}
+]
+
+dependencies = [
+    "numpy",
+    "spglib",
+    "ase",
+    "phonopy",
+    "PyQt5",
+]

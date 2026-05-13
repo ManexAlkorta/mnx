@@ -7,3 +7,4 @@ __pycache__/
 Tutorial/.ipynb_checkpoints/
 mnx.egg-info/
 src/mnx.egg-info/
+installation_details.md

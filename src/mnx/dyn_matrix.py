@@ -3,7 +3,7 @@ import mnx.utils.consts as _consts
 import mnx.utils.classify as _classify
 import mnx.FModules
 
-import symph
+import mnx.symph as symph
 
 import numpy as np
 import spglib
@@ -455,7 +455,7 @@ class DynMatrix:
             assert len(np.shape(self._QE_translations_irt)) == 2, "Error, symmetries not setted up to work in the supercell"
             symph.trans_v2(new_phiR, self._QE_translations_irt)
         # Apply the symmetrization
-        symph.sym_v2(new_phiR, self._QE_at, self._QE_bg, self._QE_s, self._QE_irt, self._QE_nsym, self._QE_nat)
+        symph.sym_v2(new_phiR, self._QE_at, self._QE_bg, self._QE_s, self._QE_irt, self._QE_nsym)
         # Return back
         for i in range(self._QE_nat):
             for j in range(self._QE_nat):
