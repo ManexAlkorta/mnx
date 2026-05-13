@@ -6,6 +6,8 @@
 
 It is recommended to prepare a clean python environment to install ***mnx***.
 
+### venv
+
 ```bash
 cd ~/path_to_your_venvs
 python -m venv mnx
@@ -17,6 +19,18 @@ pip install ./
 deactivate
 ```
 
+### conda
+
+```bash
+conda create -n mnx -c conda-forge python=3.10 numpy pkg-config libblas liblapack
+conda activate mnx
+cd ~/path_to_installation_dir
+git clone https://github.com/ManexAlkorta/mnx.git
+cd mnx
+pip install ./ 
+conda deactivate
+```
+## Jupyter kernel
 For jupyter lab users, the following lines install the mnx kernel with interactive utilities.
 
 ```bash
