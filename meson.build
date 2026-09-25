@@ -27,10 +27,17 @@ install_subdir('src/mnx', install_dir : py.get_install_dir())
 # =============================================================================
 # 2. Extension Module: FModules
 # =============================================================================
-fmod_src = 'src/mnx/FModules/interpolation.f90'
+fmod_path = 'src/mnx/FModules/'
+fmod_filenames = ['io.f90', 'interpolation.f90', 'bands.f90']
+
+fmod_sources = []
+foreach f : fmod_filenames
+  fmod_sources += fmod_path + f
+endforeach
+
 fmod_gen = custom_target(
   'fmodules_f2py',
-  input : fmod_src,
+  input : fmod_sources,
   output : ['FModulesmodule.c', 'FModules-f2pywrappers2.f90'],
   command : [py, '-m', 'numpy.f2py', '@INPUT@', '-m', 'FModules', '--lower', '--build-dir', '.'],
   build_by_default : true
@@ -38,7 +45,7 @@ fmod_gen = custom_target(
 
 py.extension_module(
   'FModules',
-  [fmod_src, fmod_gen, fortranobject_c],
+  [fmod_sources, fmod_gen, fortranobject_c],
   dependencies : [py_dep, lapack_dep, blas_dep],
   include_directories : numpy_includes,
   install : true,

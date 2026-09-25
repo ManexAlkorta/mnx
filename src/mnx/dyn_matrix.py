@@ -8,7 +8,14 @@ import mnx.symph as symph
 import numpy as np
 import spglib
 import phonopy
+
+import cellconstructor as CC
+import cellconstructor.Phonons
+
 import copy
+
+import glob
+import os
 
 from .structure import Structure
 
@@ -94,12 +101,15 @@ class DynMatrix:
         instance = cls()
         instance.Nqirr = qgrid[0]*qgrid[1]*qgrid[2]
         instance.qgrid = qgrid
-        instance.structure = Structure.from_file(f"{folder}/primPOSCAR", format="vasp")
+        try:
+            instance.structure = Structure.from_file(f"{folder}/primPOSCAR", format="vasp")
+        except:
+            instance.structure = Structure.from_file(f"{folder}/POSCAR", format="vasp")
         instance._alat = np.linalg.norm(instance.structure.cell[0,:])
 
         instance.super_structure = instance.structure.expand_structure(instance.qgrid)
 
-        _phonon = phonopy.load(f"{folder}/phonopy.yaml")
+        _phonon = phonopy.load(f"{folder}/phonopy_disp.yaml")
         instance.structure.masses = _phonon.masses / _consts.Ry2AMU
         instance.DynQs = np.empty([instance.Nqirr], dtype=object)
         instance.qstars = np.empty([instance.Nqirr], dtype=object)
@@ -590,6 +600,57 @@ class DynMatrix:
         for si, star in enumerate(self.qstars):
             self.DynQs[si].write(f"{file}{si+1}")
 
+    def to_CC(self):
+        """
+        Dirty interface with CC, writing the dyn files in qe format, and reading
+        them from scratch with CC.
+        """
+        prefix = "./tmp_dyns2CC.dyn"
+        self.write(prefix)
+        
+        try:
+            dyn_CC = CC.Phonons.Phonons(prefix, nqirr=self.Nqirr)
+        finally:
+            # Safely remove all temporary dyn files (dyn1, dyn2, etc.) created during write
+            for filepath in glob.glob(f"{prefix}*"):
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+        return dyn_CC
+
+    def get_Pmn(self, symprec=1e-5):
+        """
+        This function construct the P matrix.
+        
+        Parameters
+        ----------
+
+        Returns
+        -------
+            - Pmn: np.ndarray
+                Pmn matrix. Dimension [Nmode,Nmode,Nsym_lg]
+        """
+        mapping, map_uc, rot_cart = _cell.map_singlet(self.to_CC(), symprec=symprec)
+
+        nmodes = self.structure.Natoms*3
+        nat_sc = self.super_structure.Natoms
+        nsym = rot_cart.shape[0]
+        rot_pol_vec = np.empty([nat_sc,3], dtype=np.complex128)
+        for qi, dynq in enumerate(self.DynQs):
+            dynq.Pmn = np.zeros([nmodes,nmodes,len(dynq.lg_idx)], dtype = np.complex128)
+            expanded_polvecs = np.empty([nmodes,nat_sc*3], dtype=np.complex128)
+            for mu in range(nmodes):
+                expanded_polvecs[mu,:] = dynq._expand_polvecs([mu],self.qgrid)[0][0][0]
+            for li,lgi in enumerate(dynq.lg_idx):
+                isym = lgi
+                for mu in range(nmodes):
+                    for nu in range(nmodes):
+                        if dynq.degs[mu,nu]:
+                            for a in range(nat_sc):
+                                b = mapping[a,isym]
+                                for alpha in range(3):
+                                    ref_pol_vec = np.reshape(expanded_polvecs[nu],[nat_sc,3])
+                                    rot_pol_vec[b, alpha] = np.matmul(rot_cart[isym,alpha,:],np.transpose(ref_pol_vec[a,:]))
+                                dynq.Pmn[mu,nu,li] = np.matmul(np.conjugate(expanded_polvecs[mu]),np.transpose(np.reshape(rot_pol_vec, [nat_sc*3])))
 
 class DynQ:
     """
@@ -634,7 +695,7 @@ class DynQ:
                 i += 1
             instance.qpoints_cart[q_index] = np.array([(data[i][:]).split()[3:6]])
             instance.qpoints_cart[q_index] = instance.qpoints_cart[q_index]/instance._alat
-            instance.qpoints[q_index] = _cell.cart2cryst(instance.qpoints_cart[q_index]*instance._alat, instance.structure.rcell)
+            instance.qpoints[q_index] = _cell.cart2cryst(instance.qpoints_cart[q_index], instance.structure.rcell)
             i += 2
             for n1 in range(instance.structure.Natoms):
                 for n2 in range(instance.structure.Natoms):
@@ -664,6 +725,10 @@ class DynQ:
             instance.frequencies[qi,:], instance.polvecs[qi,:], instance.displacements[qi,:] = instance._diagdynq(qi)
         
         instance.frequencies = np.sqrt(instance.frequencies) * _consts.Ry2cm
+
+        # Post-processing:
+        instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0]) # All q-points have the same lg.
+        instance._find_degs()
         return instance
     
     @classmethod
@@ -706,6 +771,10 @@ class DynQ:
             instance.frequencies[qi,:], instance.polvecs[qi,:] = frequencies[qi], polvecs[qi]
         
         instance.frequencies = np.sqrt(instance.frequencies) * _consts.Ry2cm
+
+        # Post-processing:
+        instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0]) # All q-points have the same lg.
+        instance._find_degs()
         return instance
 
     def _phis2dyns(self) -> None:
@@ -910,3 +979,95 @@ class DynQ:
                     disp[atom*3+2].imag,
                 ))
         file.write(" **************************************************************************\n")
+
+    def _find_degs(self):
+        """
+        This function looks for vibrational modes with the same wave-vector modulation
+        and degenerate energies.
+        """
+        
+        nmodes = self.structure.Natoms * 3
+        self.degs = np.zeros([nmodes,nmodes], dtype=bool)
+        for mu in range(nmodes):
+            for nu in range(nmodes):
+                if np.abs(self.frequencies[0,mu]-self.frequencies[0,nu])<1e-3:
+                    self.degs[mu,nu]=True
+
+    def _expand_polvecs(self, modes : list, mod : list) -> tuple[list, list, np.ndarray]:
+        """
+        Function to expand the polarization vectors out from the primitive cell.
+
+        Parameters
+        ----------
+            modes: list or np.ndarray.
+                Which polarization vectors or vibrational modes will be expanded.
+                Example: [0,2,3], which means the modes 0, 2 and 3.
+            mod : list or np.ndarray.
+                Modulation of the expanded polvecs. A typical choice would be the q-grid.
+        Returns
+        -------
+            polvecs_list : list of np.array.
+                List of np.arrays containing the expanded polarization vectors for the specified 
+                modes in the q-star.
+            displacements_list : list of np.array.
+                List of np.arrays containing the displacemt vectors for the specified 
+                modes in the q-star.
+            exp_masses : np.array.
+                Masses for each atom in the supercell speciefied by mod. 
+        """
+        exp_masses = np.empty([self.structure.Natoms * mod[0] * mod[1] * mod[2] * 3], complex)
+        polvecs_list = np.empty(len(modes), dtype=object)
+        displacements_list = np.empty(len(modes), dtype=object)
+        for mi,mode in enumerate(modes):
+            polvecs_instar = np.empty([self.Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
+            displacements_instar = np.empty([self.Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
+            for qi,q in enumerate(self.qpoints):
+                for i in range(mod[0]):
+                    for j in range(mod[1]):
+                        for k in range(mod[2]):
+                            polvecs_instar[
+                                qi,
+                                self.structure.Natoms
+                                * 3
+                                * (mod[1] * mod[2] * i + mod[2] * j + k) : self.structure.Natoms
+                                * 3
+                                * (mod[1] * mod[2] * i + mod[2] * j + k + 1)
+                            ] = self.polvecs[qi, mode] * np.exp(
+                                2j
+                                * np.pi
+                                * np.matmul(q,
+                                    np.array([i, j, k]),
+                                )
+                            )
+                            for atom in range(self.structure.Natoms):
+                                exp_masses[
+                                    self.structure.Natoms
+                                    * 3
+                                    * (mod[1] * mod[2] * i + mod[2] * j + k)
+                                    + atom
+                                    * 3 : self.structure.Natoms
+                                    * 3
+                                    * (mod[1] * mod[2] * i + mod[2] * j + k)
+                                    + (atom + 1) * 3
+                                ] = self.structure.masses[atom]
+                polvecs_instar[qi] = polvecs_instar[qi] / np.linalg.norm(polvecs_instar[qi])
+                ##############################################################################
+                ##### The displacements are constructed from already normalized pol vecs #####
+                ##############################################################################
+                for i in range(self.structure.Natoms * mod[0] * mod[1] * mod[2] * 3):
+                    displacements_instar[qi,i] = polvecs_instar[qi,i] / np.sqrt(exp_masses[i])
+            polvecs_list[mi] = polvecs_instar
+            displacements_list[mi] = displacements_instar
+        return polvecs_list, displacements_list, exp_masses
+
+    def compute_traces(self):
+        self.traces = np.empty([self.structure.Natoms*3,len(self.lg_idx)], dtype=np.complex128)
+        for mu in range(self.structure.Natoms*3):
+            for nu in range(self.structure.Natoms*3):
+                if self.degs[mu,nu] and mu >= nu:
+                    for li in range(len(self.lg_idx)):
+                        if np.sum(self.degs[mu] == 1):
+                            self.traces[mu,li] = self.Pmn[mu,mu,li]
+                        else:
+                            self.traces[mu,li] = np.trace(self.Pmn[self.degs[mu],self.degs[mu],li])
+                            self.traces[nu,li] = self.traces[mu,li] 

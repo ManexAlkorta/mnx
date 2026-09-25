@@ -22,4 +22,8 @@ dependencies = [
     "ase",
     "phonopy",
     "PyQt5",
+    "cellconstructor",
+    "scikit-image",
+    "pyvista",
+    "trame-pyvista",
 ]

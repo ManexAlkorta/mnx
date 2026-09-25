@@ -1,15 +1,17 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-def plot_bands(ax, qpath, bands, xticks, xlabels, color = "tab:blue", lw = 1.5, alpha=0.8, label=None):
+import mnx.FModules
+
+def plot_bands(ax, qpath, bands, xticks, xlabels, color = "tab:blue", lw = 1.5, alpha=0.8, label=None, ls='-'):
     for mode in range(len(bands[0,:])):
         if label != None:
             if mode == 0:
-                ax.plot(qpath, np.real(bands[:, mode]), color=color, alpha=alpha, lw = lw, label=label)
+                ax.plot(qpath, np.real(bands[:, mode]), color=color, alpha=alpha, lw = lw, label=label, ls=ls)
             else:
-                ax.plot(qpath, np.real(bands[:, mode]), color=color, alpha=alpha, lw = lw)
+                ax.plot(qpath, np.real(bands[:, mode]), color=color, alpha=alpha, lw = lw, ls = ls)
         else:
-            ax.plot(qpath, np.real(bands[:, mode]), color=color, alpha=alpha, lw = lw)
+            ax.plot(qpath, np.real(bands[:, mode]), color=color, alpha=alpha, lw = lw, ls = ls)
     ax.set_ylabel(r"$\omega$ (cm$^{-1}$)", fontsize=12)
     ax.set_ylim(bands.min()-10, bands.max()+10), ax.set_xlim(0, qpath[-1])
     ax.tick_params(labelsize=12)
@@ -90,20 +92,22 @@ def plot_bands_segment(qpath, bands, data, xticks, xlabels):
     ax.tick_params(labelsize=12)
 
 
-def map_from_bands(ax, qpath, bands, xticks, xlabels, data, Ny=1000, sigma=10, vmin=0, vmax=None):
+def map_from_bands(ax, qpath, bands, xticks, xlabels, data, emin, emax, Ny=1000, sigma=10, vmin=0, vmax=None, dy=20, cmap="plasma"):
     if vmax == None:
         vmax = np.real(data.max())
     grid_x = qpath
-    grid_y = np.arange(0, np.real(bands.max())+20, (np.real(bands.max())+20)/Ny)
+    grid_y = np.arange(emin-dy, emax+dy, ((emax-emin)+2*dy)/Ny)
     mmap = np.zeros([len(grid_x), len(grid_y)], dtype=float)
-    for xi, x in enumerate(grid_x):
-        for yi, y in enumerate(grid_y):
-            for mode in range(12):
-                mmap[xi,yi] += gaussian(np.real(bands[xi, mode])-y, sigma=sigma)*data[xi,mode]
+
+    mmap = mnx.FModules.io.get_map_from_bands(grid_x, grid_y, bands, data, sigma)
+    # for xi, x in enumerate(grid_x):
+    #     for yi, y in enumerate(grid_y):
+    #         for mode in range(bands.shape[1]):
+    #             mmap[xi,yi] += gaussian(np.real(bands[xi, mode])-y, sigma=sigma)*data[xi,mode]
     #ax = plot_bands(ax, qpath, bands, xticks, xlabels)
-    ax.imshow(mmap.T, interpolation="gaussian", origin="lower", aspect="auto",  extent=[grid_x[0], grid_x[-1], grid_y[0], grid_y[-1]], vmin=0, vmax=vmax, cmap="plasma")
-    plot_bands(ax,qpath,bands,xticks,xlabels,color="white",alpha=0.2)
-    ax.set_ylim(0,(np.real(bands.max())+20))
+    ax.imshow(mmap.T, interpolation="gaussian", origin="lower", aspect="auto",  extent=[grid_x[0], grid_x[-1], grid_y[0], grid_y[-1]], vmin=vmin, vmax=vmax, cmap=cmap)
+    plot_bands(ax,qpath,bands,xticks,xlabels,color="black",alpha=0.2)
+    ax.set_ylim(emin,emax)
     # ax.set_xticks(xticks,xlabels)
     # ax.set_ylabel("$\omega$ (cm$^{-1}$)", fontsize=12)
     # ax.tick_params(labelsize=12)
