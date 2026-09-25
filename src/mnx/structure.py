@@ -4,7 +4,9 @@ import mnx.utils.classify as _classify
 
 import numpy as np
 import spglib
-import ase.io
+import ase
+import cellconstructor as CC
+import cellconstructor.Structure
 import copy
 
 
@@ -91,7 +93,7 @@ class Structure:
                 for j in range(3):
                     tmp_cell[i, j] = float((data[4 + i].split())[j])
             instance.cell = alat * tmp_cell
-            instance.rcell = _cell.get_rcell(tmp_cell)  # Not in alat units in Angstroms
+            instance.rcell = _cell.get_rcell(tmp_cell * alat)  # Not in alat units in Angstroms
             for i in range(instance.Nspecies):
                 atomic_species_dict[data[7 + i].split()[1][1:]] = data[7 + i].split()[0]
                 atomic_masses_dict[data[7 + i].split()[0]] = data[7 + i].split()[3]
@@ -461,6 +463,32 @@ class Structure:
                 A copy of the Structure object.
         """
         return copy.deepcopy(self)
+
+    def to_ASE(self) -> ase.Atoms:
+        """
+        Translates the mnx.Structure object to an ase.Atoms object.
+
+        Returns
+        -------
+            ase.Atoms
+                An ASE Atoms object containing the symbols, positions, and cell.
+        """
+        # Extract element symbols from the first column of atom_species
+        symbols = self.atom_species[:, 0]
+        
+        # Extract Cartesian coordinates and cell
+        positions = self.atom_coords
+        cell = self.cell
+        
+        # Construct and return the ase.Atoms object (defaulting pbc=True for periodic systems)
+        atom = ase.Atoms(symbols=symbols, positions=positions, cell=cell, pbc=True)
+        
+        return atom
+
+    def to_CC(self) -> "CC.Structure":
+        structure = CC.Structure.Structure()
+        structure.generate_from_ase_atoms(self.to_ASE())
+        return structure
     
     def plot_bz(self, ax: object = None, color: str = "black", kpoints: list = None, labels: list = None) -> object:
         """
@@ -556,6 +584,18 @@ class Structure:
             pass
             
         return(ax)
+
+    def get_symmetries(self, symprec=1e-5):
+        syms = spglib.get_symmetry(self.get_spglib_cell(), symprec=symprec)
+        R, T = syms["rotations"], syms["translations"]
+
+        R_cart, T_cart = np.empty(R.shape, dtype=np.float64), np.empty(T.shape, dtype=np.float64)
+        for ti in range(len(T)):
+            T_cart[ti,:] = self.cell @ T[ti]
+        for ri in range(len(R)):
+            R_cart[ri,:] = _cell.matrix_cryst2cart(R[ri], self.cell)
+
+        return R, T, R_cart, T_cart
 
 
 def _get_atom_species_from_atom_numbers(atom_numbers):
