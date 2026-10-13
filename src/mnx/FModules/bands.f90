@@ -80,4 +80,101 @@ subroutine get_nesting(Ndown, modulation, downsample, hugek, diffuse_fermis, &
 
     deallocate(diffuse_lookup)
 end subroutine get_nesting
+
+subroutine get_Xnk(Ndown,nmin,nmax,bigEnk,sigma,hugek,modulation,downsample,Xnk,downk, &
+ispin, Nk, Nb)
+
+    ! We need to rewrite this based on the bigEnk, same as nesting!!
+    integer, intent(in) :: Ndown, nmin, nmax
+    
+    double precision, dimension(ispin,Nk,Nb) :: bigEnk
+    double precision, intent(in) :: sigma
+    
+    integer, dimension(Nk, 3), intent(in) :: hugek
+    integer, dimension(3), intent(in) :: modulation, downsample
+
+    complex(kind=8), dimension(ispin, Nb, Ndown), intent(out) :: Xnk
+    double precision, dimension(Ndown, 3), intent(out) :: downk
+    
+    complex(kind=8), parameter :: j = (0.0d0, 1.0d0)
+    double precision, parameter :: delta = 1.0d-12
+    
+    double precision, allocatable :: bigEnk_lookup(:,:,:,:,:)
+
+    integer, dimension(3) :: downmod
+
+    double precision :: gEnk, gEmq, Enk_e, Emq_e
+    integer :: ki, si, n, m, k1i, k2i, k3i, ski, ispin, Nk, Nb
+    integer :: q1i, q2i, q3i, qi
+
+    Xnk = (0.0d0,0.0d0)
+
+    downmod(1) = modulation(1) / downsample(1) 
+    downmod(2) = modulation(2) / downsample(2)
+    downmod(3) = modulation(3) / downsample(3)
+
+    allocate(bigEnk_lookup(ispin, Nb, modulation(1), modulation(2), modulation(3)))
+
+    do ki = 1, Nk
+        do si = 1, ispin
+            do n = 1, Nb
+            bigEnk_lookup(si, n, &
+    hugek(ki, 1) + 1, &
+    hugek(ki, 2) + 1, &
+    hugek(ki, 3) + 1) = bigEnk(si,ki,n)
+            end do
+        end do
+    end do
+
+    do si = 1, ispin
+        do n = nmin+1, nmax+1
+        do m = nmin+1, nmax+1
+            do k1i = 0, downmod(1)-1
+            do k2i = 0, downmod(2)-1
+            do k3i = 0, downmod(3)-1
+                
+                ki = k1i * downsample(1) * modulation(2) * modulation(3) + &
+    k2i * downsample(2) * modulation(3) + &
+    k3i * downsample(3) + 1
+
+                ski = k1i * downmod(2) * downmod(3) + k2i * downmod(3) + k3i + 1
+
+                downk(ski, 1) = 1.0d0 * hugek(ki, 1) / dble(downsample(1))
+                downk(ski, 2) = 1.0d0 * hugek(ki, 2) / dble(downsample(2))
+                downk(ski, 3) = 1.0d0 * hugek(ki, 3) / dble(downsample(3))
+
+                Enk_e = bigEnk_lookup(si,n,hugek(ki,1)+1,hugek(ki,2)+1,hugek(ki,3)+1)
+                gEnk = fermi_dirac(Enk_e, sigma)
+                do q1i = 0, downmod(1)-1
+                do q2i = 0, downmod(2)-1
+                do q3i = 0, downmod(3)-1
+                    qi = q1i * downsample(1) * modulation(2) * modulation(3) + &
+    q2i * downsample(2) * modulation(3) + &
+    q3i * downsample(3) + 1
+
+                    Emq_e = bigEnk_lookup(si,m,hugek(qi,1)+1,hugek(qi,2)+1,hugek(qi,3)+1)
+                    gEmq = fermi_dirac(Emq_e, sigma)
+
+                    Xnk(si,n,ski) =  Xnk(si,n,ski) - & ! Here we define the sign convention!
+(gEnk-gEmq) / (Enk_e-Emq_e+j*delta)
+                end do
+                end do
+                end do
+            end do
+            end do
+            end do
+        end do
+        end do
+    end do
+end subroutine get_Xnk
+
+pure function fermi_dirac(x,sigma) result(fx)
+    double precision, intent(in) :: x
+    double precision, intent(in) :: sigma
+
+    double precision :: fx
+
+    fx = 1.0d0/(exp(x/sigma)+1)
+end function fermi_dirac
+
 end module bands

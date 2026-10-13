@@ -3,6 +3,7 @@ import mnx.utils.cell as _cell
 
 import mnx.FModules
 
+import concurrent.futures
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -10,7 +11,7 @@ import spglib
 import ase.io
 
 from scipy.interpolate import RegularGridInterpolator
-from scipy.spatial import Voronoi, Delaunay
+from scipy.spatial import Voronoi, Delaunay, ConvexHull
 
 from scipy.special import erfc
 
@@ -19,13 +20,45 @@ from skimage.measure import marching_cubes, find_contours
 import pyvista as pv
 
 class Bands():
-    def __init__(self, mod, format, folder="./", upsample=[1,1,1], magmoms=0):
+    """Object that contains the data from a regular grid band calculation. Supports
+    non-magnetic and collinear calculations."""
 
-        self.format, self.mod, self.upsample, self.magmoms = format, mod, upsample, magmoms
+    @classmethod
+    def from_nscf(cls, folder, mod, format, upsample=[1,1,1], magmoms=0):
+        """
+        Classmethor of Bands. Reads the bands from a nscf calculation.
+        
+        Parameters
+        ----------
+            folder : str
+                Path to the folder containing the OUTCAR.scf/RUN.scf.out, OUTCAR/RUN.nscf.out
+                and POSCAR/STRUCT.pwi.
+            mod : list or np.ndarray
+                The regular k-grid employed in the calculation.
+            format : str
+                The code employed for the nscf calculation.
+                Supported options:
+                    qe: Quantum-Espresso
+                    vasp: VASP
+            upsample : list or np.ndarray
+                The integers to build a denser k-grid from Fourier interpolation. For example,
+                to make a 2 times denser grid in all reciprocal lattice-vector directions we 
+                should specify upsample = [2,2,2].
+                Defaults to [1,1,1].
+            magmoms : list or np.ndarray
+                In the case of a collinear calculation, specify the local spin magnetic moment
+                of each atom. It is used to detect symmetries.
+        Returns
+        -------
+            Bands : object
+                An initialized instance of the Bands object.
+        """
+        instance = cls()
+        instance.format, instance.mod, instance.upsample, instance.magmoms = format, np.asarray(mod), np.asarray(upsample), np.asarray(magmoms)
 
-        self.Nk, self.Nbands, self.Efermi, self.Enk, self.Gnk, self.DDk, self.kpoint, self.ispin, self.structure = _read_nscf(folder, format=self.format)
+        instance.Nk, instance.Nbands, instance.Efermi, instance.Enk, instance.kpoint, instance.ispin, instance.structure = _read_nscf(folder, format=instance.format)
 
-        self.colors = [[
+        instance.colors = [[
     "#979797", "#dfb843", "#770000", "#FFFC48", "#90BE6D", "#43AA8B",
     "#4D908E", "#577590", "#495867", "#9D4EDD", "#F72585", "#6A040F",
     "#8D6E63", "#6C757D", "#FFD166", "#06D6A0", "#118AB2", "#073B4C",
@@ -43,184 +76,625 @@ class Bands():
     "#3A0CA3", "#4361EE", "#4CC9F0", "#720026", "#D81159", "#8F2D56",
     "#218380", "#73D2DE", "#F46036", "#2A9D8F", "#E9C46A", "#F4A261",
     "#264653", "#2B2D42", "#8D99AE", "#EDF2F4", "#EF233C"]
-]
+]       
+        return instance
         
 
-    def build_setup(self, filter = True, Ecut=0):
+    def build_setup(self, filter = True, Ecut=0, delta=0):
+        """
+        Function which builds the setup of the Bands object, filtering to bands crossing
+        a specified energy if desired.
+
+        Parameters
+        ----------
+            filer : boolean
+                If True, only bands crossing Ecut are considered.
+                Defaults to True.
+            Ecut : float
+                If filter == True, defines the energy employed for the 
+                filering. It is defined respect to the Fermi energy in eV.
+            delta : float
+                If filter == True, defines how close has to be a band to consider
+                it crosses Ecut.
+        Returns
+        -------
+            None
+        """
         if np.all(self.magmoms == 0):
             self.magmoms = np.zeros(self.structure.Natoms)
         # Using spglib, find the mapping to the calculated k-grid.
-        self.bigEnk, self.bigk = complete_grid(self.structure, self.Enk, self.kpoint, self.mod, self.magmoms)
+        self.bigEnk, self.bigk = _complete_grid(self.structure, self.Enk, self.kpoint, self.mod, self.magmoms)
         if filter:
-            self.fbigEnk = filter_bands(self.bigEnk, self.bigk, Ecut, self.mod, self.ispin, delta=0)
+            self.fbigEnk = _filter_bands(self.bigEnk, Ecut, self.ispin, delta=delta)
         else:
             self.fbigEnk = self.bigEnk
         # Now, using fourier interpolation, we generate a Gamma centered
         # periodic sampling of the brillouin zone.
-        self.fhugeEnk, self.hugek = denser_grid(self.bigk, self.fbigEnk, Ecut, self.mod, self.upsample, self.ispin)
-        
-    def visualize_surface(self, plot=True):
+        self.fhugeEnk, self.hugek = _denser_grid(self.bigk, self.fbigEnk, Ecut, self.mod, self.upsample, self.ispin)
+
+
+    def visualize_fsurface(self, plot=True):
+        """
+        Function that visualizes the Fermi surface.
+
+        Parameters
+        ----------
+            plot : bool
+                If True, plots the fermi surface apart from just returning the data.
+                Defaults to True.
+        Returns
+        -------
+            meshes : pyvista.PolyData
+                Pyvista meshes of the bands crossing the Fermi energy
+            bz_mesh : pyvista.PolyData
+                Pyvista mesh of the first Brillouin zone
+        """
+        nbands = self.fhugeEnk.shape[1]
         meshes = np.empty([self.ispin, self.fbigEnk.shape[2]], dtype=object)
-        do_plot = np.empty([self.ispin, self.fbigEnk.shape[2]], dtype=bool)
-        for s in range(self.ispin):
-            for n in range(self.fhugeEnk.shape[1]):
-                try:
-                    verts, faces, _, _ = marching_cubes(self.fhugeEnk[s,n], level=0.0, spacing = (1/self.upsample[0],1/self.upsample[1],1/self.upsample[2]))
-                    faces_pv = np.empty(faces.shape[0] * 4, dtype=np.int64)
-                    faces_pv[0::4] = 3
-                    faces_pv[1::4] = faces[:,0]
-                    faces_pv[2::4] = faces[:,1]
-                    faces_pv[3::4] = faces[:,2]
-                    verts /= self.mod
-                    mesh = pv.PolyData(_cell.cryst2cart(verts, self.structure.rcell), faces_pv)
-                    mesh.points = mesh.points - self.structure.rcell[0,:] - self.structure.rcell[1,:]- self.structure.rcell[2,:]
-                    meshes[s,n] = plot_fs_in_bz_voronoi(mesh, self.structure.rcell)
-                    do_plot[s,n] = True
-                except ValueError:
-                    do_plot[s,n] = False
-        bz_wire = build_bz_wireframe(self.structure.rcell)
+        do_plot = np.zeros([self.ispin, self.fbigEnk.shape[2]], dtype=bool)
+
+        # Pre-extract structure and coordinate constants
+        rcell = self.structure.rcell
+        shift = rcell[0, :] + rcell[1, :] + rcell[2, :]
+        spacing = (
+            1 / self.upsample[0],
+            1 / self.upsample[1],
+            1 / self.upsample[2],
+        )
+        mod = self.mod
+
+        def process_band(s, n):
+            """Worker function for parallel Marching Cubes + PyVista conversion."""
+            try:
+                data = self.fhugeEnk[s, n]
+                # Fast check: skip marching_cubes if level=0.0 is out of bounds
+                if data.min() > 0.0 or data.max() < 0.0:
+                    return s, n, None, False
+
+                verts, faces, _, _ = marching_cubes(
+                    data, level=0.0, spacing=spacing
+                )
+
+                # Vectorized PyVista face padding ([3, v0, v1, v2, 3, v0, ...])
+                faces_pv = np.pad(faces, ((0, 0), (1, 0)), constant_values=3).ravel()
+
+                # Transform coordinates
+                verts /= mod
+                cart_verts = _cell.cryst2cart(verts, rcell) - shift
+
+                # Create PyVista PolyData
+                mesh = pv.PolyData(cart_verts, faces_pv)
+                bz_mesh = _plot_fs_in_bz_voronoi(mesh, rcell)
+
+                return s, n, bz_mesh, True
+            except ValueError:
+                return s, n, None, False
+
+        # Parallelize Marching Cubes extraction across bands and spins
+        tasks = [
+            (s, n) for s in range(self.ispin) for n in range(nbands)
+        ]
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = executor.map(
+                lambda args: process_band(*args), tasks
+            )
+
+        for s, n, mesh, success in results:
+            if success:
+                meshes[s, n] = mesh
+                do_plot[s, n] = True
+
+        bz_wire = _build_bz_wireframe(rcell)
+
         if plot:
             pv.global_theme.jupyter_backend = "trame"
             p = pv.Plotter()
             for s in range(self.ispin):
                 for mi, mesh in enumerate(meshes[s]):
-                    if do_plot[s,mi]:
-                        p.add_mesh(mesh, color=self.colors[s][mi], specular=0.5, specular_power=20, diffuse=0.8, ambient=0.3)
+                    if do_plot[s, mi]:
+                        p.add_mesh(
+                            mesh,
+                            color=self.colors[s][mi],
+                            specular=0.5,
+                            specular_power=20,
+                            diffuse=0.8,
+                            ambient=0.3,
+                        )
             p.add_mesh(bz_wire, color="black", style="wireframe", line_width=2)
             p.show()
+
         return meshes, bz_wire
 
-    def visualize_fp(self, ax, axis="z", k=0, plot=True):
+
+    def visualize_fp(self, ax, axis="ab", k=0, plot=True):
+        """
+        Function for visualizing Fermi surface cuts.
+
+        Parameters
+        ----------
+        ax : matplotlib axis
+            Matplotlib axis in which the plane will be plotted.
+
+        axis : str
+            The two crystallographic axes defining the Fermi plane.
+            Options: "ab", "ac", or "bc".
+
+        k : float
+            Point defining the position of the plane, given in
+            fractional coordinates.
+
+        plot : bool
+            If True, plot the Fermi contours and Brillouin zone cut.
+
+        Returns
+        -------
+        contours_list : list
+            List containing the bands to plot.
+        """
+
+        rcell = np.asarray(self.structure.rcell, dtype=float)
+
+        # Reciprocal lattice vectors
+        b1 = rcell[0]
+        b2 = rcell[1]
+        b3 = rcell[2]
+
+        Mx = self.mod[0] * self.upsample[0]
+        My = self.mod[1] * self.upsample[1]
+        Mz = self.mod[2] * self.upsample[2]
+
+        # ---------------------------------------------------------------
+        # Define the cutting plane
+        # ---------------------------------------------------------------
+
+        if axis == "bc":
+            # Fixed ka = k
+            origin = k * b1
+            normal = np.cross(b2, b3)
+            cut_type = "bc"
+
+        elif axis == "ac":
+            # Fixed kb = k
+            origin = k * b2
+            normal = np.cross(b3, b1)
+            cut_type = "ac"
+
+        elif axis == "ab":
+            # Fixed kc = k
+            origin = k * b3
+            normal = np.cross(b1, b2)
+            cut_type = "ab"
+
+        else:
+            raise ValueError("axis must be 'bc', 'ac', or 'ab'")
+
+        normal_norm = np.linalg.norm(normal)
+
+        if normal_norm < 1e-14:
+            raise ValueError(
+                f"Could not construct plane normal for axis='{axis}'."
+            )
+
+        normal = normal / normal_norm
+
+        # ---------------------------------------------------------------
+        # Construct an orthonormal basis in the cutting plane.
+        # The plotted coordinates are only used for visualization;
+        # no crystallographic axis labels are assigned to them.
+        # ---------------------------------------------------------------
+
+        if cut_type == "ab":
+
+            u = b1 / np.linalg.norm(b1)
+
+            v = b2 - np.dot(b2, u) * u
+            v_norm = np.linalg.norm(v)
+
+            if v_norm < 1e-14:
+                raise ValueError(
+                    "Could not construct in-plane basis for the ab cut."
+                )
+
+            v = v / v_norm
+
+        else:
+
+            b3_norm = np.linalg.norm(b3)
+
+            if b3_norm < 1e-14:
+                raise ValueError("Could not construct the c direction.")
+
+            v = b3 / b3_norm
+
+            if cut_type == "ac":
+                x_ref = b1
+            else:
+                x_ref = b2
+
+            u = x_ref - np.dot(x_ref, v) * v
+            u_norm = np.linalg.norm(u)
+
+            if u_norm < 1e-14:
+                raise ValueError(
+                    f"Could not construct in-plane basis for "
+                    f"the {cut_type} cut."
+                )
+
+            u = u / u_norm
+
+        # ---------------------------------------------------------------
+        # Contour extraction
+        # ---------------------------------------------------------------
+
+        contours_list = [[] for _ in range(self.ispin)]
+
         for s in range(self.ispin):
+
+            spin_contours = []
+
             for n in range(self.fhugeEnk.shape[1]):
-                if axis == "a":
-                    contours = find_contours(self.fhugeEnk[s,n,int(np.round(self.mod[0]*self.upsample[0]+self.mod[0]*self.upsample[0]*k, decimals=0)),:,:], level=0)
+
+                # =======================================================
+                # bc: fixed ka, vary kb and kc
+                # =======================================================
+
+                if cut_type == "bc":
+
+                    index = int(np.round(Mx + Mx * k))
+
+                    contours = find_contours(
+                        self.fhugeEnk[s, n, index, :, :],
+                        level=0
+                    )
+
                     new_contours = []
-                    for ci,c in enumerate(contours):
-                        contours3 = np.empty([len(c),3])
+
+                    for c in contours:
+
+                        contours3 = np.empty([len(c), 3])
+
                         for yzi, yz in enumerate(c):
-                            contours3[yzi,:] = _cell.cryst2cart(np.array([k,yz[0]/(self.mod[1]*self.upsample[1])-1,yz[1]/(self.mod[2]*self.upsample[2])-1]), self.structure.rcell)
-                        segments = split_contour_by_bz(contours3, rcell = self.structure.rcell)
+
+                            kb = yz[0] / My - 1.0
+                            kc = yz[1] / Mz - 1.0
+                            ka = k
+
+                            contours3[yzi, :] = _cell.cryst2cart(
+                                np.array([ka, kb, kc]),
+                                rcell
+                            )
+
+                        segments = _split_contour_by_bz(
+                            contours3,
+                            rcell=rcell
+                        )
+
                         new_contours.extend(segments)
-                elif axis == "b":
-                    contours = find_contours(self.fhugeEnk[s,n,:,int(np.round(self.mod[1]*self.upsample[1]+self.mod[1]*self.upsample[1]*k, decimals=0)),:], level=0)
+
+                # =======================================================
+                # ac: fixed kb, vary ka and kc
+                # =======================================================
+
+                elif cut_type == "ac":
+
+                    index = int(np.round(My + My * k))
+
+                    contours = find_contours(
+                        self.fhugeEnk[s, n, :, index, :],
+                        level=0
+                    )
+
                     new_contours = []
-                    for ci,c in enumerate(contours):
-                        contours3 = np.empty([len(c),3])
+
+                    for c in contours:
+
+                        contours3 = np.empty([len(c), 3])
+
                         for xzi, xz in enumerate(c):
-                            contours3[xzi,:] = _cell.cryst2cart(np.array([xz[0]/(self.mod[0]*self.upsample[0])-1,k,xz[1]/(self.mod[2]*self.upsample[2])-1]), self.structure.rcell)
-                        segments = split_contour_by_bz(contours3, rcell = self.structure.rcell)
+
+                            ka = xz[0] / Mx - 1.0
+                            kc = xz[1] / Mz - 1.0
+                            kb = k
+
+                            contours3[xzi, :] = _cell.cryst2cart(
+                                np.array([ka, kb, kc]),
+                                rcell
+                            )
+
+                        segments = _split_contour_by_bz(
+                            contours3,
+                            rcell=rcell
+                        )
+
                         new_contours.extend(segments)
-                elif axis == "c":
-                    contours = find_contours(self.fhugeEnk[s,n,:,:,int(np.round(self.mod[2]*self.upsample[2]+self.mod[2]*self.upsample[2]*k, decimals=0))], level=0)
+
+                # =======================================================
+                # ab: fixed kc, vary ka and kb
+                # =======================================================
+
+                elif cut_type == "ab":
+
+                    index = int(np.round(Mz + Mz * k))
+
+                    contours = find_contours(
+                        self.fhugeEnk[s, n, :, :, index],
+                        level=0
+                    )
+
                     new_contours = []
-                    for ci,c in enumerate(contours):
-                        contours3 = np.empty([len(c),3])
+
+                    for c in contours:
+
+                        contours3 = np.empty([len(c), 3])
+
                         for xyi, xy in enumerate(c):
-                            contours3[xyi,:] = _cell.cryst2cart(np.array([xy[0]/(self.mod[0]*self.upsample[0])-1,xy[1]/(self.mod[1]*self.upsample[1])-1,k]), self.structure.rcell)
-                        segments = split_contour_by_bz(contours3, rcell = self.structure.rcell)
+
+                            ka = xy[0] / Mx - 1.0
+                            kb = xy[1] / My - 1.0
+                            kc = k
+
+                            contours3[xyi, :] = _cell.cryst2cart(
+                                np.array([ka, kb, kc]),
+                                rcell
+                            )
+
+                        segments = _split_contour_by_bz(
+                            contours3,
+                            rcell=rcell
+                        )
+
                         new_contours.extend(segments)
-                elif axis == "ab":
-                    contours = find_contours(np.array([self.fhugeEnk[s,n,i, i, :] for i in range(self.mod[0]*self.upsample[0]*2)]),level=0)
-                    new_contours = []
-                    for ci,c in enumerate(contours):
-                        contours3 = np.empty([len(c),3])
-                        for xzi, xz in enumerate(c):
-                            contours3[xzi,:] = _cell.cryst2cart(np.array([xz[0]/(self.mod[0]*self.upsample[0])-1,xz[0]/(self.mod[0]*self.upsample[0])-1,xz[1]/(self.mod[2]*self.upsample[2])-1]), self.structure.rcell)
-                        segments = split_contour_by_bz(contours3, rcell = self.structure.rcell)
-                        new_contours.extend(segments)
-                elif axis == "a-b":
-                    contours = find_contours(np.array([self.fhugeEnk[s,n,i, self.mod[0]*self.upsample[0]*2-i-1  , :] for i in range(self.mod[0]*self.upsample[0]*2)]),level=0)
-                    new_contours = []
-                    for ci,c in enumerate(contours):
-                        contours3 = np.empty([len(c),3])
-                        for xzi, xz in enumerate(c):
-                            contours3[xzi,:] = _cell.cryst2cart(np.array([xz[0]/(self.mod[0]*self.upsample[0])-1,-xz[0]/(self.mod[0]*self.upsample[0])+1,xz[1]/(self.mod[2]*self.upsample[2])-1]), self.structure.rcell)
-                        segments = split_contour_by_bz(contours3, rcell = self.structure.rcell)
-                        new_contours.extend(segments)
-                elif axis == "2ab":
-                    contours = find_contours(np.array([self.fhugeEnk[s,n,2*i,int(self.mod[0]*self.upsample[0]*3/4)-i-1,:] for i in range(self.mod[0]*self.upsample[0])]),level=0)
-                    new_contours = []
-                    for ci,c in enumerate(contours):
-                        contours3 = np.empty([len(c),3])
-                        for xzi, xz in enumerate(c):
-                            contours3[xzi,:] = _cell.cryst2cart(np.array([xz[0]/(self.mod[0]*self.upsample[0])*2-1,-xz[0]/(self.mod[0]*self.upsample[0])/2+1,xz[1]/(self.mod[2]*self.upsample[2])-1]), self.structure.rcell)
-                        segments = split_contour_by_bz(contours3, rcell = self.structure.rcell)
-                        new_contours.extend(segments)
-                contours = new_contours
-                if n == 0:
-                    contours_list = [contours]
-                else:
-                    contours_list.append(contours)
-            if plot:
-                for n,contour in enumerate(contours_list):
-                    for c in contour:
-                        ax.plot(c[:,0], c[:,1], color=self.colors[s][n], alpha=0.5)
-        
+
+                # -------------------------------------------------------
+                # Store contours
+                # -------------------------------------------------------
+
+                spin_contours.append(new_contours)
+
+                # -------------------------------------------------------
+                # Plot Fermi contours
+                # -------------------------------------------------------
+
+                if plot:
+
+                    for c in new_contours:
+
+                        c_rel = c - origin
+
+                        # Project onto the in-plane basis
+                        c_u = c_rel @ u
+                        c_v = c_rel @ v
+
+                        ax.plot(
+                            c_u,
+                            c_v,
+                            color=self.colors[s][n],
+                            alpha=0.5
+                        )
+
+            contours_list[s] = spin_contours
+
+        # ===============================================================
+        # Brillouin zone cut
+        # ===============================================================
+
         if plot:
-            bz_mesh = build_bz_mesh(self.structure.rcell)  # reuse your BZ generator
-            bz_points = bz_mesh.points
+
+            bz_mesh = _build_bz_mesh(rcell)
+
+            bz_points = np.asarray(bz_mesh.points)
             bz_faces = bz_mesh.faces.reshape(-1, 4)[:, 1:]
 
-            z0 = 0.0
             for f in bz_faces:
+
                 tri = bz_points[f]
 
-                # Separate vertices by z position
-                z = tri[:, 2]
-                above = z > z0
-                below = z < z0
+                # Signed distance from the cutting plane
+                dists = (tri - origin) @ normal
 
-                if np.any(above) and np.any(below):
-                    # Plane cuts this triangle → find intersection points
-                    pts = []
-                    for i in range(3):
-                        j = (i + 1) % 3
-                        z1, z2 = z[i], z[j]
-                        if (z1 - z0) * (z2 - z0) <= 0:  # Edge crosses plane
-                            t = (z0 - z1) / (z2 - z1 + 1e-16)
-                            pt = tri[i] + t * (tri[j] - tri[i])
-                            pts.append(pt)
+                # Triangle entirely on one side of the plane
+                if np.all(dists > 0):
+                    continue
 
-                    if len(pts) == 2:
-                        xy = np.array(pts)[:, :2]
-                        ax.plot(xy[:, 0], xy[:, 1], color='black', linewidth=1.0)
-            ax.set_aspect('equal', adjustable='box')
-            ax.set_xlabel(r'$k_x (2\pi/{\AA})$', fontsize=12)
-            ax.set_ylabel(r'$k_y (2\pi/{\AA})$', fontsize=12)
-            ax.tick_params(labelsize=12)
+                if np.all(dists < 0):
+                    continue
+
+                pts = []
+
+                # -------------------------------------------------------
+                # Intersect triangle edges with the plane
+                # -------------------------------------------------------
+
+                for i in range(3):
+
+                    j = (i + 1) % 3
+
+                    d1 = dists[i]
+                    d2 = dists[j]
+
+                    # Vertex lies on the plane
+                    if abs(d1) < 1e-12:
+                        pts.append(tri[i])
+
+                    # Edge crosses the plane
+                    if d1 * d2 < 0:
+
+                        t = d1 / (d1 - d2)
+
+                        pt = tri[i] + t * (tri[j] - tri[i])
+
+                        pts.append(pt)
+
+                # -------------------------------------------------------
+                # Remove duplicate intersection points
+                # -------------------------------------------------------
+
+                unique_pts = []
+
+                for p in pts:
+
+                    if not any(
+                        np.linalg.norm(p - q) < 1e-10
+                        for q in unique_pts
+                    ):
+                        unique_pts.append(p)
+
+                if len(unique_pts) == 2:
+
+                    pts_arr = np.asarray(unique_pts) - origin
+
+                    # Project BZ boundary into the same plane coordinates
+                    bz_u = pts_arr @ u
+                    bz_v = pts_arr @ v
+
+                    ax.plot(
+                        bz_u,
+                        bz_v,
+                        color="black",
+                        linewidth=1.0
+                    )
+
+            # -----------------------------------------------------------
+            # Final plot formatting: no axes, ticks, labels, or frame
+            # -----------------------------------------------------------
+
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_axis_off()
+
         return contours_list
+    
+    def get_bands(self, k_inpath, N):
+        """
+        Function to obtain visualization ready bands. The interpolation is unphysical, and completly fails in 
+        band crossings and parallel bands.
         
+        Parameters
+        ----------
+            k_inpath : list or np.ndarray
+                k-path in fractional coordinates.
+            N : int
+                Number of points to include between the k-points defined by k-path
+
+        Returns
+        -------
+            bands : np.ndarray
+                Visualization ready bands in eV.
+            rq : np.ndarray
+                x-axis for the visualization of the bands.
+            xticks : np.ndarray
+                Values of rq that correspond to the points defined by k_inpath.
+        """
+
+        k_inpath = np.asarray(k_inpath)
+        qpath=np.empty([len(k_inpath)*(N+1),3])
+        bands = np.empty([self.ispin,len(k_inpath)*(N+1),self.bigEnk.shape[2],])
+        rq = np.zeros(len(k_inpath)*(N+1))
+        xticks = [0]
+        for ki,ks in enumerate(k_inpath):
+            dk = (ks[1]-ks[0])
+            rq[ki*(N+1):(ki+1)*(N+1)] = rq[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell))*np.arange(0,10+10/N,10/N)
+            xticks.append(rq[(ki+1)*(N+1)-1])
+            dk = dk * self.mod
+            qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]*self.mod
+        for s in range(self.ispin):
+            for n in range(self.bigEnk.shape[2]):
+                f_fft = _fourier_interpolator(self.bigk, self.bigEnk[s,:,n], shape=(self.mod[0], self.mod[1], self.mod[2]), upsample=self.upsample)
+                bands[s,:,n] = f_fft(qpath)
+        return bands, rq, xticks
+    
+    def get_Nsq(self, sigma=1e-2, downsample=[1,1,1], Ecut = 0):
+        """
+        Function that computes the q-resolved nesting function. Interface of the 
+        fortran subroutine FModules.bands.get_nesting().
         
-    def visualize_diffuse_fp(self, f1, kmax=0.3, sigma=5e-3):
-        diffuse_fermi = np.average(smear_bands(self.fhugeEnk, sigma=sigma), axis=0)
-        shape = (self.mod[0]*2*self.upsample[0], self.mod[1]*2*self.upsample[1], self.mod[2]*2*self.upsample[2])
-        f_fft = fourier_interpolator(self.hugek, diffuse_fermi, shape=shape)
-        kxs, kys = np.arange(-kmax,kmax,2e-3), np.arange(-kmax,kmax,2e-3)
-        X = np.empty([len(kxs), len(kys)])
-        for kxi,kx in enumerate(kxs):
-            for kyi,ky in enumerate(kys):
-                X[kxi,kyi] = f_fft(_cell.cart2cryst(np.array([kx,ky,0])*self.mod, self.structure.rcell))
-        f1.imshow(X,vmin=0)
-    
-    def get_gaussian_bands(self, Ecut, sigma=5e-3):
-        bigEnk, bigk = denser_grid(self.bigk, self.bigEnk, Ecut, self.mod, self.upsample, self.ispin, fix_rcell=True)
-        diffuse_fermis = smear_bands(bigEnk, sigma=sigma)
-        return diffuse_fermis, bigk
-    
-    
-    def get_Nsk(self, sigma=1e-2, downsample=[1,1,1], Ecut = 0):
+        Parameters
+        ----------
+            sigma : float
+                Smearing parameter in eV.
+                Defaults to 1e-2.
+            downsample : list or np.ndarray
+                Downsampling grid to makes the calculation affordable.
+                Defaults to [1,1,1].
+            Ecut : float
+                Energy in which the gaussian smearing is employed.
+                Defaults to 0 (i.e. the Fermi energy).
+
+        Returns
+        -------
+            None
+        """
+
         Nk = self.bigk.shape[0]
         Ndown = int(Nk/np.prod(downsample))
 
         self.Nsk = np.zeros([self.ispin,Ndown])
-        self.downk = np.empty([Ndown,3])
-        diffuse_fermis, hugek = self.get_gaussian_bands(Ecut=Ecut, sigma=sigma)
+        self.Nsk_downk = np.empty([Ndown,3])
+        diffuse_fermis, hugek = self._get_gaussian_bands(Ecut=Ecut, sigma=sigma)
+  
         hugek = np.round(hugek)
+        self.Nsk, self.Nsk_downk = mnx.FModules.bands.get_nesting(Ndown, self.mod, downsample, hugek, diffuse_fermis)
 
-        self.Nsk, self.downk = mnx.FModules.bands.get_nesting(Ndown, self.mod, downsample, hugek, diffuse_fermis)
+    def get_Xnk(self,nmin,nmax,sigma=1e-2,downsample=[1,1,1]):
+        """
+        Function that computes the band resolved Lindhard susceptibility nesting function.
+        Interface of the fortran subroutine FModules.bands.get_xnk(). Fermi dirac distribution
+        function is employed, where sigma == kbT in eV.
+        
+        Parameters
+        ----------
+            nmin : integer
+                Index of the first band conidered in the calculation of Xnk.
+            nmax : integer
+                Index of the last band considered in the calculation of Xnk.
+            sigma : float
+                Smearing parameter in eV.
+                Defaults to 1e-2.
+            downsample : list or np.ndarray
+                Downsampling grid to makes the calculation affordable.
+                Defaults to [1,1,1].
 
-    def get_nesting_qpath(self, k_inpath, N, downsample):
+        Returns
+        -------
+            None
+        """
+        
+        N = nmax-nmin+1
+        Nk = self.bigk.shape[0]
+        Ndown = int(Nk/np.prod(downsample))
+
+        self.Xnk = np.zeros([self.ispin,N,Ndown])
+        self.Xnk_downk = np.empty([Ndown,3])
+
+        # this function is not needed, but its the way hugek is implemented at the moment
+        diffuse_fermis, hugek = self._get_gaussian_bands(Ecut=0, sigma=sigma)
+
+        self.Xnk, self.Xnk_downk = mnx.FModules.bands.get_xnk(Ndown,nmin,nmax,self.bigEnk,sigma,hugek,self.mod,downsample)
+
+    def get_nesting_qpath(self, k_inpath, N=50, downsample=[1,1,1]):
+        """
+        Function to obtain a visualization ready nesting in a q-path.
+
+        Parameters
+        ----------
+            k_inpath : list or np.ndarray
+                k-path in fractional coordinates.
+            N : int
+                Number of points to include between the k-points defined by k-path.
+                Defaults to 50.
+            downsample: list or np.ndarray
+                Downsample employed at get_Nsk.
+                Defaults to [1,1,1].
+        
+        Returns
+        -------
+            nesting : np.ndarray
+                k-resolved nesting function in units of (states/spin/eV^2).
+            rq : np.ndarray
+                x-axis for the visualization of the nesting function.
+            xticks : np.ndarray
+                Values of rq that correspond to the points defined by k_inpath.
+        """
+        
         k_inpath = np.asarray(k_inpath)
         qpath=np.empty([len(k_inpath)*(N+1),3])
         nesting = np.zeros([self.ispin, len(qpath)])
@@ -233,32 +707,38 @@ class Bands():
             dk = dk * self.mod
             qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]*self.mod
         for si in range(self.ispin):
-            f_fft = fourier_interpolator(self.downk, self.Nsk[si], shape=(int(self.mod[0]/downsample[0]), int(self.mod[1]/downsample[1]), int(self.mod[2]/downsample[2])), upsample=self.upsample)
+            f_fft = _fourier_interpolator(self.Nsk_downk, self.Nsk[si], shape=(int(self.mod[0]/downsample[0]), int(self.mod[1]/downsample[1]), int(self.mod[2]/downsample[2])), upsample=self.upsample)
             nesting[si] = f_fft(qpath/downsample)
         return nesting, rq, xticks
 
+    def get_Xnk_qpath(self, k_inpath, N=50, downsample=[1,1,1]):
+        """
+        Function to obtain a visualization ready Xnk in a q-path.
 
-    def get_dos(self, N, Emin, Emax, sigma):
-        Es = np.arange(Emin,Emax+(Emax-Emin)/N,(Emax-Emin)/N)
-        DOS = np.zeros([self.ispin, N+1])
-        for Ei,E in enumerate(Es):
-            diffuse_fermis, hugek = self.get_gaussian_bands(Ecut=E, sigma=sigma)
-            hugek = np.round(hugek)
-            my_dict = {tuple(np.array([s,hugek[i,0],hugek[i,1],hugek[i,2]], dtype=int)): diffuse_fermis[s,i] for s in range(diffuse_fermis.shape[0]) for i in range(diffuse_fermis.shape[1])}
-            for s in range(self.ispin):
-                for kxi in range(int(self.mod[0])):
-                    for kyi in range(int(self.mod[1])):
-                        for kzi in range(int(self.mod[2])):
-                            try:
-                                DOS[s,Ei] += my_dict[tuple([s,kxi,kyi,kzi])]
-                            except:
-                                breakpoint()
-        return DOS, Es
-    
-    def get_bands(self, k_inpath, N):
+        Parameters
+        ----------
+            k_inpath : list or np.ndarray
+                k-path in fractional coordinates.
+            N : int
+                Number of points to include between the k-points defined by k-path.
+                Defaults to 50.
+            downsample: list or np.ndarray
+                Downsample employed at get_Nsk.
+                Defaults to [1,1,1].
+        
+        Returns
+        -------
+            Xnk : np.ndarray
+                k-resolved Xnk function in units of (states/spin/eV^2).
+            rq : np.ndarray
+                x-axis for the visualization of the nesting function.
+            xticks : np.ndarray
+                Values of rq that correspond to the points defined by k_inpath.
+        """
+        
         k_inpath = np.asarray(k_inpath)
         qpath=np.empty([len(k_inpath)*(N+1),3])
-        bands = np.empty([self.ispin,self.bigEnk.shape[2],len(k_inpath)*(N+1)])
+        xnk = np.zeros([self.ispin, len(qpath), self.Xnk.shape[1]])
         rq = np.zeros(len(k_inpath)*(N+1))
         xticks = [0]
         for ki,ks in enumerate(k_inpath):
@@ -267,99 +747,36 @@ class Bands():
             xticks.append(rq[(ki+1)*(N+1)-1])
             dk = dk * self.mod
             qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]*self.mod
-        for s in range(self.ispin):
-            for n in range(self.bigEnk.shape[2]):
-                f_fft = fourier_interpolator(self.bigk, self.bigEnk[s,:,n], shape=(self.mod[0], self.mod[1], self.mod[2]), upsample=self.upsample)
-                bands[s,n] = f_fft(qpath)
-        return bands, rq, xticks
+        for si in range(self.ispin):
+            for ni in range(self.Xnk.shape[1]):
+                f_fft = _fourier_interpolator(self.Xnk_downk, self.Xnk[si,ni], shape=(int(self.mod[0]/downsample[0]), int(self.mod[1]/downsample[1]), int(self.mod[2]/downsample[2])), upsample=self.upsample)
+                xnk[si,:,ni] = f_fft(qpath/downsample)
+        return xnk, rq, xticks
     
-    def get_linewidth(self, k_inpath, N):
-        k_inpath = np.asarray(k_inpath)
-        qpath=np.empty([len(k_inpath)*(N+1),3])
-        linewidth = np.empty([1,self.bigGnk.shape[2],len(k_inpath)*(N+1)])
-        rq = np.zeros(len(k_inpath)*(N+1))
-        xticks = [0]
-        for ki,ks in enumerate(k_inpath):
-            dk = (ks[1]-ks[0])
-            rq[ki*(N+1):(ki+1)*(N+1)] = rq[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell))*np.arange(0,10+10/N,10/N)
-            xticks.append(rq[(ki+1)*(N+1)-1])
-            dk = dk * self.mod
-            qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]*self.mod
-        for n in range(self.bigGnk.shape[2]):
-            f_fft = fourier_interpolator(self.bigk, self.bigGnk[0,:,n], shape=(self.mod[0], self.mod[1], self.mod[2]), upsample=self.upsample)
-            linewidth[0,n] = f_fft(qpath)
-            for qi, gamma in enumerate(linewidth[0,n]):
-                if gamma < 0:
-                    linewidth[0,n,qi] = np.abs(linewidth[0,n,:]).min()*np.exp(gamma)
-        return linewidth, rq, xticks
-    
-    def get_doubledeltas(self, k_inpath, N):
-        k_inpath = np.asarray(k_inpath)
-        qpath=np.empty([len(k_inpath)*(N+1),3])
-        dd = np.empty([1,len(qpath)])
-        rq = np.zeros(len(k_inpath)*(N+1))
-        xticks = [0]
-        for ki,ks in enumerate(k_inpath):
-            dk = (ks[1]-ks[0])
-            rq[ki*(N+1):(ki+1)*(N+1)] = rq[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell))*np.arange(0,10+10/N,10/N)
-            xticks.append(rq[(ki+1)*(N+1)-1])
-            dk = dk * self.mod
-            qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]*self.mod
-        f_fft = fourier_interpolator(self.bigk, self.bigDDk[0,:], shape=(self.mod[0], self.mod[1], self.mod[2]), upsample=self.upsample)
-        dd[0] = f_fft(qpath)
-        for qi, d in enumerate(dd[0]):
-                if d < 0:
-                    dd[0,qi] = np.exp(d)
-        return dd, rq, xticks
+    def _get_gaussian_bands(self, Ecut, sigma=5e-3):
+        bigEnk, bigk = _denser_grid(self.bigk, self.bigEnk, Ecut, self.mod, self.upsample, self.ispin, fix_rcell=True)
+        diffuse_fermis = _smear_bands(bigEnk, sigma=sigma)
+        return diffuse_fermis, bigk
 
-
-###############################################################################################
-# Some day we will have to implement proper fourier interpolations of the dynamical matrixes. #
-###############################################################################################
-# def get_PhiR(qpoints, list_of_dyns):
-#     Nq = len(qpoints)
-#     Phi_R = np.empty([len(Rs), Natoms, Natoms, 3, 3])
-#     for R in Rs:
-#         for qi, q in qpoints:
-#             dyn = list_of_dyns[qi]
-#             for a in range(Natoms):
-#                 for b in range(Natoms):
-#                     for alpha in range(3):
-#                         for beta in range(3):
-#                             Phi_R[R,a,b,alpha,beta] = 1/Nq*np.sum(np.sqrt(dyn.masses[a]*dyn.masses[b])*dyn.dyn_matrixes[0,a,b,alpha,beta])*np.exp(-1j*np.matmul(q*Rs[ri]))
-#     return Phi_R
-
-# def get_DQ(qpoint, PhiR, masses):
-#     DQ = np.empty([Natoms, Natoms, 3, 3])
-#     for R in Rs:
-#         for a in range(Natoms):
-#             for b in range(Natoms):
-#                 for alpha in range(3):
-#                     for beta in range(3):
-#                         DQ[a,b,alpha,beta] += 1/np.sqrt(masses[a]*masses[b])*PhiR[R,a,b,alpha,beta]*np.exp(1j*np.matmul(qpoint,R))
-#     return DQ
-
-    
-
-def fourier_interpolator(kpoints, energies, shape, upsample=(1,1,1)):
+def _fourier_interpolator(kpoints, energies, shape, upsample=(1,1,1)):
     """
     Fourier-based interpolation for band energies on a uniform 3D k-grid.
 
     Parameters
     ----------
-    kpoints : (Nk,3) array
-        k-points (assumed uniform grid, ordered consistently with `shape`)
-    energies : (Nk,) array
-        Energies at each k-point
-    shape : tuple of ints (Nx, Ny, Nz)
-        Grid dimensions of the uniform mesh
-    upsample : tuple (ux, uy, uz)
-        Factor to upsample in each direction
+        kpoints : (Nk,3) array
+            k-points (assumed uniform grid, ordered consistently with `shape`)
+        energies : (Nk,) array
+            Energies at each k-point
+        shape : tuple of ints (Nx, Ny, Nz)
+            Grid dimensions of the uniform mesh
+        upsample : tuple (ux, uy, uz)
+            Factor to upsample in each direction
 
     Returns
     -------
-    f : callable
-        Interpolator f(K) with K (...,3) returning interpolated energies
+        f : callable
+            Interpolator f(K) with K (...,3) returning interpolated energies
     """
 
     
@@ -412,7 +829,7 @@ def fourier_interpolator(kpoints, energies, shape, upsample=(1,1,1)):
     return f
 
 
-def denser_grid(big_kpoint, big_Enk, Ecut, mod, upsample, ispin, fix_rcell=False):
+def _denser_grid(big_kpoint, big_Enk, Ecut, mod, upsample, ispin, fix_rcell=False):
     tmp_mod = np.empty(len(mod), dtype=int)
     if fix_rcell:
         tmp_mod[0], tmp_mod[1], tmp_mod[2] = mod[0]*upsample[0], mod[1]*upsample[1], mod[2]*upsample[2]
@@ -440,14 +857,14 @@ def denser_grid(big_kpoint, big_Enk, Ecut, mod, upsample, ispin, fix_rcell=False
 
     for s in range(ispin):
         for n in range(big_Enk.shape[2]):
-            f_fft = fourier_interpolator(big_kpoint, big_Enk[s,:,n]-Ecut, shape=(mod[0], mod[1], mod[2]), upsample=upsample)
+            f_fft = _fourier_interpolator(big_kpoint, big_Enk[s,:,n]-Ecut, shape=(mod[0], mod[1], mod[2]), upsample=upsample)
             huge_Enk[s,n] = f_fft(points).reshape(len(kxs), len(kys), len(kzs))
     return huge_Enk, points
 
 
-def complete_grid(structure, Enk, kpoint, mod, magmoms=0, symprec=1e-5):
+def _complete_grid(structure, Enk, kpoint, mod, magmoms=0, symprec=1e-5):
     cell = (structure.cell, _cell.cart2cryst(structure.atom_coords, structure.cell), structure.atom_species[:,1])
-    mapping, address, trs = get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec)
+    mapping, address, trs = _get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec)
     kgrid = np.array([[i, j, k]
                     for i in range(mod[0])
                     for j in range(mod[1])
@@ -462,7 +879,7 @@ def complete_grid(structure, Enk, kpoint, mod, magmoms=0, symprec=1e-5):
     return big_Enk, kgrid
 
 
-def filter_bands(big_Enk, kpoints, Efermi, mod, ispin, delta = 0):
+def _filter_bands(big_Enk, Efermi, ispin, delta = 0):
     """In case of a colinear calcuation, the spins must be aligned with the
     c axis."""
     fermi_bands = []
@@ -481,21 +898,21 @@ def filter_bands(big_Enk, kpoints, Efermi, mod, ispin, delta = 0):
                 fermi_Enk[si,:,ii] = big_Enk[si,:,ni]
     return(fermi_Enk)
 
-def gaussian(x, sigma):
+def _gaussian(x, sigma):
     return 1/(sigma*np.sqrt(2*np.pi))*np.exp(-1/2*(x**2/sigma**2))
 
-def smear_bands(Enk, sigma=5e-3):
+def _smear_bands(Enk, sigma=5e-3):
     diffuse_fermi = np.zeros([Enk.shape[0],Enk.shape[2], Enk.shape[3], Enk.shape[4]])
     for s in  range(Enk.shape[0]): 
         for n in range(Enk.shape[1]):
-            diffuse_fermi[s] += gaussian(Enk[s,n,:,:,:], sigma=sigma)
+            diffuse_fermi[s] += _gaussian(Enk[s,n,:,:,:], sigma=sigma)
     if Enk.shape[0] == 1:
         return np.array([diffuse_fermi[0].ravel("C")])
     else:
         return np.array([diffuse_fermi[0].ravel("C"), diffuse_fermi[1].ravel("C")])
 
 
-def compute_bz_vertices(rcell, nmax=2):
+def _compute_bz_vertices(rcell, nmax=2):
     """
     Compute vertices of the first Brillouin zone using Voronoi/Wigner-Seitz around origin.
     """
@@ -516,55 +933,66 @@ def compute_bz_vertices(rcell, nmax=2):
     bz_vertices = np.unique(np.array(bz_vertices), axis=0)
     return bz_vertices
 
-# ---------------------------
-# Filter FS mesh using BZ convex hull
-# ---------------------------
-def filter_fs_inside_bz_voronoi(fs, rcell, nmax=2, tol=1e-8, cut=True):
-    """
-    Remove triangles of FS mesh if any vertex is outside the first BZ.
-    """
-    # Compute BZ vertices and convex hull
-    bz_vertices = compute_bz_vertices(rcell, nmax=nmax)
-    hull = Delaunay(bz_vertices)
 
-    # Check which points are inside BZ
+def _filter_fs_inside_bz_voronoi(
+    fs, rcell, nmax=2, tol=1e-8, cut=True, is_masked=False
+):
+    """Remove triangles of FS mesh if any vertex is outside the first BZ.
+
+    Fast vectorized implementation that preserves original cell orientation.
+    """
     points = fs.points
-    inside_mask = hull.find_simplex(points) >= 0
-    positive_mask = np.all(points>=0, axis=1)
 
-    outside_indices = np.where(~inside_mask)[0]
-    positive_indices = np.where(~positive_mask)[0]
+    # 1. Get exact BZ vertices in real coordinate space and extract plane equations
+    bz_vertices = _compute_bz_vertices(rcell, nmax=nmax)
+    hull = ConvexHull(bz_vertices)
 
-    # Filter faces: remove any triangle with at least one vertex outside
+    # hull.equations gives plane equations: A*x + B*y + C*z + D <= 0
+    planes = hull.equations  # shape: (N_planes, 4)
+    normals = planes[:, :-1]  # A, B, C
+    offsets = planes[:, -1]  # D
+
+    # 2. Fast analytical inside-BZ check: point is inside if ALL A*x + B*y + C*z + D <= 1e-8
+    inside_mask = np.all((points @ normals.T + offsets) <= 1e-8, axis=1)
+
+    # 3. Extract vertex indices for all faces simultaneously: shape (N_faces, 3)
     faces = fs.faces.reshape(-1, 4)
-    keep_faces = []
-    for f in faces:
-        vidxs = f[1:]
-        if not np.any(np.isin(vidxs, outside_indices)):
-            if cut:
-                if np.any(np.isin(vidxs, positive_indices)):
-                    keep_faces.append(f)
-            else:
-                keep_faces.append(f)
+    vidxs = faces[:, 1:]
+
+    # 4. Keep face ONLY if ALL 3 vertices are inside the BZ
+    keep_face_mask = np.all(inside_mask[vidxs], axis=1)
+
+    # 5. Vectorized octant cutting (if enabled)
+    if cut and is_masked:
+        positive_points = np.all(points >= 0, axis=1)
+        # Keep face if at least one vertex is negative (~positive)
+        has_negative_vertex = np.any(~positive_points[vidxs], axis=1)
+        keep_face_mask &= has_negative_vertex
+
+    keep_faces = faces[keep_face_mask]
+
     if len(keep_faces) == 0:
         print("Warning: no faces remain inside first BZ!")
         return None
 
-    new_faces = np.array(keep_faces).ravel()
-    filtered_fs = pv.PolyData(points, new_faces)
+    # Reconstruct PyVista PolyData mesh
+    filtered_fs = pv.PolyData(points, keep_faces.ravel())
     filtered_fs = filtered_fs.triangulate().clean(tolerance=tol)
     if filtered_fs.n_faces_strict > 0:
-        filtered_fs = filtered_fs.compute_normals(auto_orient_normals=True, feature_angle=150)
+        filtered_fs = filtered_fs.compute_normals(
+            auto_orient_normals=True, feature_angle=150
+        )
+
     return filtered_fs
 
 # ---------------------------
 # Build BZ wireframe mesh
 # ---------------------------
-def build_bz_mesh(rcell, nmax=2):
+def _build_bz_mesh(rcell, nmax=2):
     """
     Build wireframe mesh for first BZ (Voronoi around origin)
     """
-    bz_vertices = compute_bz_vertices(rcell, nmax=nmax)
+    bz_vertices = _compute_bz_vertices(rcell, nmax=nmax)
     hull = Delaunay(bz_vertices)
     # Extract convex hull simplices for wireframe
     faces = []
@@ -577,11 +1005,11 @@ def build_bz_mesh(rcell, nmax=2):
 # ---------------------------
 # Plot FS inside BZ
 # ---------------------------
-def plot_fs_in_bz_voronoi(fs_mesh, rcell, nmax=2, fs_color="orange"):
-    filtered_fs = filter_fs_inside_bz_voronoi(fs_mesh, rcell, nmax=nmax)
+def _plot_fs_in_bz_voronoi(fs_mesh, rcell, nmax=2):
+    filtered_fs = _filter_fs_inside_bz_voronoi(fs_mesh, rcell, nmax=nmax)
     return filtered_fs
 
-def build_bz_wireframe(rcell, nmax=2):
+def _build_bz_wireframe(rcell, nmax=2):
     """
     Build a clean wireframe-only Brillouin Zone mesh for visualization.
     
@@ -623,7 +1051,7 @@ def build_bz_wireframe(rcell, nmax=2):
     bz_edges = pv.PolyData(vertices, faces)
     return bz_edges
 
-def is_point_inside_bz(k, rcell, tol=1e-8):
+def _is_point_inside_bz(k, rcell, tol=1e-8):
     """
     Check if point k is inside the first Brillouin Zone using Wigner–Seitz construction.
     """
@@ -652,27 +1080,27 @@ def is_point_inside_bz(k, rcell, tol=1e-8):
     return True
 
 
-def split_contour_by_bz(contour, rcell):
+def _split_contour_by_bz(contour, rcell):
     """
     Split a contour into smaller ones, keeping only the points inside the BZ.
 
     Parameters
     ----------
-    contour : np.ndarray
-        Array of shape (N, 3) representing one contour polyline.
-    rcell : np.ndarray
-        3x3 reciprocal lattice vectors.
+        contour : np.ndarray
+            Array of shape (N, 3) representing one contour polyline.
+        rcell : np.ndarray
+            3x3 reciprocal lattice vectors.
 
     Returns
     -------
-    inside_segments : list of np.ndarray
-        List of new contour segments fully inside the BZ.
+        inside_segments : list of np.ndarray
+            List of new contour segments fully inside the BZ.
     """
     inside_segments = []
     current_segment = []
 
     for point in contour:
-        if is_point_inside_bz([point[0], point[1], point[2]], rcell):
+        if _is_point_inside_bz([point[0], point[1], point[2]], rcell):
             current_segment.append(point)
         else:
             # If leaving BZ, save current segment if it has enough points
@@ -686,49 +1114,9 @@ def split_contour_by_bz(contour, rcell):
 
     return inside_segments
 
-def split_by_mask(mesh, mask):
-    """
-    Split a contour into smaller ones, keeping only the points inside the BZ.
 
-    Parameters
-    ----------
-    contour : np.ndarray
-        Array of shape (N, 3) representing one contour polyline.
-    rcell : np.ndarray
-        3x3 reciprocal lattice vectors.
 
-    Returns
-    -------
-    inside_segments : list of np.ndarray
-        List of new contour segments fully inside the BZ.
-    """
-    inside_segments = []
-    current_segment = []
-
-    for pi, point in enumerate(mesh.points):
-        if mask[pi]:
-            current_segment.append(point)
-        else:
-            # If leaving BZ, save current segment if it has enough points
-            if len(current_segment) > 1:
-                inside_segments.append(np.array(current_segment))
-            current_segment = []  # reset segment
-
-    # Save any leftover segment
-    if len(current_segment) > 1:
-        inside_segments.append(np.array(current_segment))
-    
-    inside_meshes = []
-    for segment in inside_segments:
-        mesh = pv.PolyData()
-        mesh.points = np.array(segment)
-        n = len(segment)
-        mesh.lines = np.hstack([[n], np.arange(n)])
-        inside_meshes.append(mesh)
-
-    return inside_meshes
-
-def inrcell(k, mod):
+def _inrcell(k, mod):
     for i in range(3):
         if k[i]<0 and k[i]%mod[i]!=0:
             k[i]+=(np.abs(k[i])//mod[i]+1)*mod[i]
@@ -739,7 +1127,7 @@ def inrcell(k, mod):
     return np.round(k)
 
 
-def get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec=1e-5):
+def _get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec=1e-5):
     """
     """
     tmp_kpoint = np.copy(kpoint)
@@ -765,7 +1153,7 @@ def get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec=1e-5):
 
     mapping = -np.ones(len(kgrid), dtype=int)
     trs_map = np.ones(len(kgrid), dtype=int)
-    address_dict = {tuple(inrcell(tmp_kpoint[i], mod)):i for i in range(len(tmp_kpoint))}
+    address_dict = {tuple(_inrcell(tmp_kpoint[i], mod)):i for i in range(len(tmp_kpoint))}
 
     rkg_list = []
     for kgi, kg in enumerate(kgrid):
@@ -775,9 +1163,9 @@ def get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec=1e-5):
         for ri, R in enumerate(rotations):
             try:
                 if time_reversals[ri] == 0:
-                    rkg = tuple(inrcell(np.matmul(-np.transpose(R), tmp_kg), mod))
+                    rkg = tuple(_inrcell(np.matmul(-np.transpose(R), tmp_kg), mod))
                 else:
-                    rkg = tuple(inrcell(np.matmul(np.transpose(R), tmp_kg), mod))
+                    rkg = tuple(_inrcell(np.matmul(np.transpose(R), tmp_kg), mod))
                 mapping[kgi] = address_dict[rkg]
                 trs_map[kgi] = time_reversals[ri]
                 is_found = True
@@ -788,47 +1176,6 @@ def get_ir_reciprocal_mesh_magnetic(mod, cell, magmoms, kpoint, symprec=1e-5):
             rkg_list.append(kg)
             print(f"{kgi}:{kg}-->{tmp_kg}-->{rkg}-->X")
     return(mapping, address_dict, trs_map)
-
-def mp(x):
-    return 0.5 * erfc(x) + (x/np.sqrt(np.pi)) * np.exp(-x*x)
-
-def nesting_k(qpath,Enk,hugek,n,mmin,mmax,smearing,degauss,mod,downsample):
-    delta = 1e-12
-    ispin = Enk.shape[0]
-    value = np.zeros([ispin,int(mod[0]/downsample[0]),int(mod[1]/downsample[1]),int(mod[2]/downsample[2])])
-    downk = np.empty([int(hugek.shape[0]/(downsample[0]*downsample[1]*downsample[2])),3])
-    nesting = np.empty([ispin,len(qpath)])
-    if smearing == "mp":
-        for s in range(ispin):
-            for m in range(mmin,mmax+1):
-                for qxi in range(int(mod[0]/downsample[0])):
-                    for qyi in range(int(mod[1]/downsample[1])):
-                        for qzi in range(int(mod[2]/downsample[2])):
-                            for kxi in range(int(mod[0]/downsample[0])):
-                                for kyi in range(int(mod[1]/downsample[1])):
-                                    for kzi in range(int(mod[2]/downsample[2])):
-                                        ki = kxi*downsample[0]*mod[1]*mod[2]+kyi*downsample[1]*mod[2]+kzi*downsample[2]
-                                        kxii, kyii, kzii = kxi*downsample[0],kyi*downsample[1],kzi*downsample[2]
-                                        qxii, qyii, qzii = qxi*downsample[0],qyi*downsample[1],qzi*downsample[2]
-                                        value[s,kxi,kyi,kzi] += (mp(Enk[s,n,kxii,kyii,kzii]/degauss) - mp(Enk[s,m,qxii,qyii,qzii]/degauss))/(Enk[s,n,kxii,kyii,kzii]-Enk[s,m,qxii,qyii,qzii]+1j*delta)
-                                        ski = int(kxi*mod[1]*mod[2]/(downsample[2]*downsample[1])+kyi*mod[2]/downsample[2]+kzi)
-                                        downk[ski] = hugek[ki]/downsample
-        f_fft = fourier_interpolator(downk, value[s], shape=(int(mod[0]/downsample[0]), int(mod[1]/downsample[1]), int(mod[2]/downsample[2])), upsample=[2,2,2])
-        nesting[s] = f_fft(qpath/np.array(downsample))
-    return nesting
-
-def get_qpath(k_inpath, N, structure, mod):
-    k_inpath = np.asarray(k_inpath)
-    qpath=np.empty([len(k_inpath)*(N+1),3])
-    rq = np.zeros(len(k_inpath)*(N+1))
-    xticks = [0]
-    for ki,ks in enumerate(k_inpath):
-        dk = (ks[1]-ks[0])
-        rq[ki*(N+1):(ki+1)*(N+1)] = rq[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, structure.rcell))*np.arange(0,10+10/N,10/N)
-        xticks.append(rq[(ki+1)*(N+1)-1])
-        dk = dk * mod
-        qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]*mod
-    return qpath
 
 
 def _read_nscf(folder, format):
@@ -922,11 +1269,9 @@ def _read_nscf(folder, format):
                             Enk[1,ki,:] = tmp_Enk
                             i+=j+1
                     break
-            atom = ase.io.read(f"{folder}/RUN.nscf.in", format="espresso-in")
-            structure = Structure.from_ASE(atom)
+            structure = Structure.from_file(f"{folder}/STRUCT.pwi", format="qe")
 
     elif format=="vasp":
-        # NOT TESTED !!!!!!!
         info = os.popen(f"grep NKPTS {folder}/OUTCAR").read()
         Nk, Nbands = int(info.split()[3]), int(info.split()[-1])
         info = os.popen(f"grep E-fermi {folder}/OUTCAR.scf").read()
@@ -940,28 +1285,50 @@ def _read_nscf(folder, format):
                     kpoint = np.zeros([Nk,3])
                     if ispin == 1:
                         Enk = np.zeros([ispin, Nk, Nbands])
-                        k = li+2
-                        for ik in range(Nk):
-                            k+=2
-                            kpoint[ik] = [float(fileread[k].split()[-3]), float(fileread[k].split()[-2]), float(fileread[k].split()[-1])]
-                            k+=1
-                            for ib in range(Nbands):
-                                k+=1
-                                Enk[0,ik,ib] = float(fileread[k].split()[1])
-                    elif ispin == 2:
-                        Enk = np.zeros([ispin, Nk, Nbands])
-                        k = li+2
-                        for ispin in range(2):
+                        try:
+                            k = li+2
                             for ik in range(Nk):
                                 k+=2
                                 kpoint[ik] = [float(fileread[k].split()[-3]), float(fileread[k].split()[-2]), float(fileread[k].split()[-1])]
                                 k+=1
                                 for ib in range(Nbands):
                                     k+=1
-                                    Enk[ispin,ik,ib] = float(fileread[k].split()[1])
+                                    Enk[0,ik,ib] = float(fileread[k].split()[1])
+                        except:
+                            k = li+5
+                            for ik in range(Nk):
+                                k+=2
+                                kpoint[ik] = [float(fileread[k].split()[-3]), float(fileread[k].split()[-2]), float(fileread[k].split()[-1])]
+                                k+=1
+                                for ib in range(Nbands):
+                                    k+=1
+                                    Enk[0,ik,ib] = float(fileread[k].split()[1])
+                    elif ispin == 2:
+                        # Not tested.
+                        Enk = np.zeros([ispin, Nk, Nbands])
+                        try:
+                            k = li+2
+                            for ispin in range(2):
+                                for ik in range(Nk):
+                                    k+=2
+                                    kpoint[ik] = [float(fileread[k].split()[-3]), float(fileread[k].split()[-2]), float(fileread[k].split()[-1])]
+                                    k+=1
+                                    for ib in range(Nbands):
+                                        k+=1
+                                        Enk[ispin,ik,ib] = float(fileread[k].split()[1])
+                        except:
+                            k = li+5
+                            for ispin in range(2):
+                                for ik in range(Nk):
+                                    k+=2
+                                    kpoint[ik] = [float(fileread[k].split()[-3]), float(fileread[k].split()[-2]), float(fileread[k].split()[-1])]
+                                    k+=1
+                                    for ib in range(Nbands):
+                                        k+=1
+                                        Enk[ispin,ik,ib] = float(fileread[k].split()[1])
                     break
         structure = Structure.from_file(f"{folder}/POSCAR", format="vasp")
     else:
         print("This format is not implemented.")
         raise NotImplementedError
-    return Nk, Nbands, Efermi, Enk-Efermi, np.zeros(Enk.shape), np.zeros([Enk.shape[0], Enk.shape[1]]), kpoint, ispin, structure
+    return Nk, Nbands, Efermi, Enk-Efermi, kpoint, ispin, structure

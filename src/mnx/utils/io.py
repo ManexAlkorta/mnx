@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
 
 import mnx.FModules
 
@@ -91,27 +92,37 @@ def plot_bands_segment(qpath, bands, data, xticks, xlabels):
 
     ax.tick_params(labelsize=12)
 
-
-def map_from_bands(ax, qpath, bands, xticks, xlabels, data, emin, emax, Ny=1000, sigma=10, vmin=0, vmax=None, dy=20, cmap="plasma"):
-    if vmax == None:
+def map_from_bands(ax, qpath, bands, xticks, xlabels, data, emin, emax, Ny=1000, Nx_uniform=500, sigma=10, vmin=0, vmax=None, dy=20, cmap="plasma", bcolor="black"):
+    if vmax is None:
         vmax = np.real(data.max())
+        
     grid_x = qpath
-    grid_y = np.arange(emin-dy, emax+dy, ((emax-emin)+2*dy)/Ny)
-    mmap = np.zeros([len(grid_x), len(grid_y)], dtype=float)
-
-    mmap = mnx.FModules.io.get_map_from_bands(grid_x, grid_y, bands, data, sigma)
-    # for xi, x in enumerate(grid_x):
-    #     for yi, y in enumerate(grid_y):
-    #         for mode in range(bands.shape[1]):
-    #             mmap[xi,yi] += gaussian(np.real(bands[xi, mode])-y, sigma=sigma)*data[xi,mode]
-    #ax = plot_bands(ax, qpath, bands, xticks, xlabels)
-    ax.imshow(mmap.T, interpolation="gaussian", origin="lower", aspect="auto",  extent=[grid_x[0], grid_x[-1], grid_y[0], grid_y[-1]], vmin=vmin, vmax=vmax, cmap=cmap)
-    plot_bands(ax,qpath,bands,xticks,xlabels,color="black",alpha=0.2)
-    ax.set_ylim(emin,emax)
-    # ax.set_xticks(xticks,xlabels)
-    # ax.set_ylabel("$\omega$ (cm$^{-1}$)", fontsize=12)
-    # ax.tick_params(labelsize=12)
-    return(ax, mmap.T, grid_x, grid_y)
+    grid_y = np.linspace(emin - dy, emax + dy, Ny)
+    
+    # 1. Get the map from Fortran using the original uneven grid
+    mmap = mnx.FModules.io.get_map_from_bands(grid_x, grid_y, bands, data, sigma) # shape: (len(qpath), Ny)
+    
+    # 2. Create a perfectly uniform X-grid for smooth plotting
+    grid_x_uniform = np.linspace(grid_x[0], grid_x[-1], Nx_uniform)
+    
+    # 3. Interpolate the map rows onto the uniform X-grid
+    mmap_smooth = np.zeros((Nx_uniform, Ny))
+    for yi in range(Ny):
+        f_interp = interp1d(grid_x, mmap[:, yi], kind='linear')
+        mmap_smooth[:, yi] = f_interp(grid_x_uniform)
+        
+    ax.imshow(mmap_smooth.T, interpolation="bilinear", origin="lower", aspect="auto", 
+              extent=[grid_x_uniform[0], grid_x_uniform[-1], grid_y[0], grid_y[-1]], 
+              vmin=vmin, vmax=vmax, cmap=cmap)
+    
+    plot_bands(ax, qpath, bands, xticks, xlabels, color=bcolor, alpha=0.2)
+    
+    ax.set_xlim(grid_x[0], grid_x[-1])
+    ax.set_ylim(emin, emax)
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(xlabels)
+    
+    return ax, mmap_smooth.T, grid_x_uniform, grid_y
 
 def gaussian(freq, sigma):
     return 1/(sigma*np.sqrt(np.pi*2))*np.exp(-0.5*(np.conj(freq)*freq)/(sigma)**2)

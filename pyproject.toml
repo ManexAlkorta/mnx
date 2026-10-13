@@ -26,4 +26,5 @@ dependencies = [
     "scikit-image",
     "pyvista",
     "trame-pyvista",
+    "nest_asyncio2",
 ]
