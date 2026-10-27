@@ -143,7 +143,10 @@ class DynMatrix:
         instance._alat = np.linalg.norm(instance.structure.cell[0, :])
         instance.super_structure = instance.structure.expand_structure(instance.qgrid)
 
-        phonon = phonopy.load(f"{folder}/phonopy_disp.yaml")
+        try:
+            phonon = phonopy.load(f"{folder}/phonopy_disp.yaml")
+        except:
+            phonon = phonopy.load(f"{folder}/phonopy.yaml")
         masses = phonon.masses / _consts.Ry2AMU
         instance.structure.masses = masses
         nat = instance.structure.Natoms
