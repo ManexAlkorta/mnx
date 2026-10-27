@@ -1,1073 +1,882 @@
-import mnx.utils.cell as _cell
-import mnx.utils.consts as _consts
-import mnx.utils.classify as _classify
-import mnx.FModules
+"""
+Phonon spectra on a q-grid: dynamical matrices, force constants and related tools.
 
-import mnx.symph as symph
+The module exposes two classes:
+
+* :class:`DynMatrix` holds the full phonon problem of a crystal: the structure, the
+  dynamical matrices of every irreducible q-star of a grid and the real-space force
+  constants obtained from them. It interpolates the spectrum to any q-point, builds
+  band structures, distorts the structure along phonon modes and symmetrizes the
+  force constants.
+* :class:`DynQ` holds the dynamical matrices of a single q-star (one QuantumESPRESSO
+  ``dyn`` file) together with their eigenvalues and eigenvectors.
+
+Units follow QuantumESPRESSO unless stated otherwise: force constants in Ry/bohr^2,
+masses in Ry atomic units, lengths in Angstrom and frequencies in cm^-1. Imaginary
+frequencies are stored as complex numbers and reported as negative values in band
+structures.
+
+See ``Tutorial/DynMatrix.ipynb`` for a guided tour.
+"""
+
+from __future__ import annotations
+
+import copy
+import tempfile
 
 import numpy as np
-import spglib
 import phonopy
+import spglib
 
 import cellconstructor as CC
 import cellconstructor.Phonons
 
-import copy
-
-import glob
-import os
+import mnx.symph as symph
+import mnx.utils.cell as _cell
+import mnx.utils.classify as _classify
+import mnx.utils.consts as _consts
+from mnx.FModules import interpolation as _interpolation
 
 from .structure import Structure
 
 
 class DynMatrix:
     """
-    Main class which contains all the information of a phonon spectra. Its utilities are presented
-    in the Tutorial/DynMatrix.ipynb notebook.
+    Phonon spectra of a crystal computed on a regular q-grid.
+
+    Build instances with :meth:`from_file` (QuantumESPRESSO ``dyn`` files) or
+    :meth:`from_phonopy` (VASP + phonopy). Usage examples are collected in the
+    ``Tutorial/DynMatrix.ipynb`` notebook.
+
+    Attributes
+    ----------
+    structure : Structure
+        Primitive cell.
+    super_structure : Structure
+        Supercell commensurate with ``qgrid``, used for the real-space force constants.
+    qgrid : list of int, [3]
+        q-grid on which the dynamical matrices were computed.
+    Nqirr : int
+        Number of irreducible q-stars.
+    Nqpoints : int
+        Total number of q-points in the grid (sum over all stars).
+    DynQs : np.ndarray of DynQ, [Nqirr]
+        Dynamical matrices of each q-star.
+    qstars : np.ndarray of np.ndarray, [Nqirr]
+        q-points of each star in fractional units, ``qstars[s]`` has shape [Nqinstar, 3].
+    phiR : np.ndarray, [Nat_sc, Nat_sc, 3, 3]
+        Real-space force constants of the supercell.
     """
 
     @classmethod
-    def from_file(cls, file: str, qgrid: list=[0,0,0], Nqirr: int = 0) -> "DynMatrix": 
+    def from_file(cls, file: str, qgrid: list | None = None, Nqirr: int = 0) -> "DynMatrix":
         """
-        Classmethod of DynMatrix. Reads the phonon spectra from a set of QuantumEspresso
-        dyn files.
+        Read the phonon spectra from a set of QuantumESPRESSO ``dyn`` files.
 
         Parameters
         ----------
         file : str
-            Path to dyn including the prefix. In the case of reading a unique q-point,
-            the complete file name needs to be included.
-        qgrid : list or np.ndarray
-            qgrid where the phonon spectra is computed.
-            Defaults to [0,0,0].
-        Nqirr : int
-            Number of irreducible q-points in the grid. If Nqirr=0, a unique q-point is 
-            read, and file must be the complete file name.
-            Defaults to [0,0,0].
+            Prefix of the dyn files, e.g. ``"./hessian"`` to read ``hessian1`` ...
+            ``hessianN``. When ``Nqirr=0`` it is the full name of a single dyn file.
+        qgrid : list of int, [3], optional
+            q-grid on which the phonon spectra was computed. Defaults to ``[0, 0, 0]``,
+            i.e. no grid (only meaningful when reading a single file).
+        Nqirr : int, optional
+            Number of irreducible q-points in the grid. With ``Nqirr=0`` (default) only
+            the single file ``file`` is read and no real-space force constants are built.
 
         Returns
         -------
-        DynMatrix : object
-            An instance with the class containing the phonon spectra.
+        DynMatrix
+            The phonon spectra.
+
+        Examples
+        --------
+        >>> dyn = DynMatrix.from_file("./dyns/CrSb/750/hessianv4_", qgrid=[2, 2, 2], Nqirr=4)
         """
         instance = cls()
-        instance.Nqirr = Nqirr
-        if instance.Nqirr == 0:
-            instance.structure = Structure.from_file(file, format="dyn")
-            instance.qgrid = qgrid
-        else:
-            instance.qgrid = qgrid
-            instance.structure = Structure.from_file(f"{file}1", format="dyn")
-            instance.super_structure = instance.structure.expand_structure(instance.qgrid)
-        if instance.Nqirr == 0:
-            instance.DynQs = np.empty([1], dtype=object)
-            instance.qstars = np.empty([1], dtype=object)
+        instance.qgrid = [0, 0, 0] if qgrid is None else qgrid
+        files = [file] if Nqirr == 0 else [f"{file}{s + 1}" for s in range(Nqirr)]
 
-            instance.DynQs = DynQ.from_file(file)
-            instance.qstars[0] =instance.DynQs[0].qpoints
-            instance.Nqpoints = instance.DynQs[qs].Nqinstar
-        else:
-            instance.DynQs = np.empty([instance.Nqirr], dtype=object)
-            instance.qstars = np.empty([instance.Nqirr], dtype=object)
-            for qirr in range(instance.Nqirr):
-                instance.DynQs[qirr] = DynQ.from_file(f"{file}{qirr+1}")
-                instance.qstars[qirr] = instance.DynQs[qirr].qpoints
-            instance.Nqpoints = 0
-            for qs in range(instance.Nqirr):
-                instance.Nqpoints += instance.DynQs[qs].Nqinstar
-            instance.get_phiR()
+        instance.structure = Structure.from_file(files[0], format="dyn")
+        instance.Nqirr = len(files)
+        instance.DynQs = np.empty(instance.Nqirr, dtype=object)
+        instance.qstars = np.empty(instance.Nqirr, dtype=object)
+        for s, name in enumerate(files):
+            instance.DynQs[s] = DynQ.from_file(name)
+            instance.qstars[s] = instance.DynQs[s].qpoints
+        instance.Nqpoints = sum(dynq.Nqinstar for dynq in instance.DynQs)
         instance._alat = instance.DynQs[0]._alat
-        return(instance)
+
+        if Nqirr > 0:
+            instance.super_structure = instance.structure.expand_structure(instance.qgrid)
+            instance.get_phiR()
+        return instance
 
     @classmethod
-    def from_phonopy(cls, folder: str, qgrid: list) -> "DynMatrix": 
+    def from_phonopy(cls, folder: str, qgrid: list) -> "DynMatrix":
         """
-        Classmethod of DynMatrix. Reads the force constants and structure info from the folder in which
-        a VASP-phonopy calculation was previously performed. The primitive structure needs to be named
-        primPOSCAR.
+        Read the force constants of a VASP + phonopy calculation.
+
+        The structure is read from ``primPOSCAR`` (falling back to ``POSCAR``) and the
+        force constants from ``phonopy_disp.yaml`` inside ``folder``.
 
         Parameters
         ----------
-        folder : str.
-            Path to folder the VASP-phonopy calculation folder.
-        qgrid : list or np.ndarray
-            qgrid where the phonon spectra is computed.
+        folder : str
+            Folder in which the VASP + phonopy calculation was run.
+        qgrid : list of int, [3]
+            q-grid (supercell size) of the phonopy calculation.
 
         Returns
         -------
-        DynMatrix : object
-            An instance with the class containing the phonon spectra.
+        DynMatrix
+            The phonon spectra, with one single-point star per grid point.
         """
         instance = cls()
-        instance.Nqirr = qgrid[0]*qgrid[1]*qgrid[2]
         instance.qgrid = qgrid
+        instance.Nqirr = int(np.prod(qgrid))
         try:
             instance.structure = Structure.from_file(f"{folder}/primPOSCAR", format="vasp")
-        except:
+        except FileNotFoundError:
             instance.structure = Structure.from_file(f"{folder}/POSCAR", format="vasp")
-        instance._alat = np.linalg.norm(instance.structure.cell[0,:])
-
+        instance._alat = np.linalg.norm(instance.structure.cell[0, :])
         instance.super_structure = instance.structure.expand_structure(instance.qgrid)
 
-        _phonon = phonopy.load(f"{folder}/phonopy_disp.yaml")
-        instance.structure.masses = _phonon.masses / _consts.Ry2AMU
-        instance.DynQs = np.empty([instance.Nqirr], dtype=object)
-        instance.qstars = np.empty([instance.Nqirr], dtype=object)
-        for qx in range(instance.qgrid[0]):
-            for qy in range(instance.qgrid[1]):
-                for qz in range(instance.qgrid[2]):
-                    _qx, _qy, _qz = qx/instance.qgrid[0], qy/instance.qgrid[1], qz/instance.qgrid[2]
-                    if qx == 0 and qy == 0 and qz == 0:
-                        _qpoints = [[_qx, _qy, _qz]]
-                    else:
-                        _qpoints.append([_qx, _qy, _qz])
-        instance.Nqpoints = len(_qpoints)
-        _dynqs = np.empty([instance.Nqirr, instance.structure.Natoms, instance.structure.Natoms, 3, 3], dtype=complex)
-        for qi, q in enumerate(_qpoints):
-            dynq = np.reshape(_phonon.get_dynamical_matrix_at_q(q), [instance.structure.Natoms, 3, instance.structure.Natoms, 3]) * _consts.eVA2RyBohr2 * _consts.Ry2AMU
-            dynq = np.moveaxis(dynq, [1], [2])
-            _dynqs[qi] = dynq
-            instance.qstars[qi] = np.asarray([q])
-        _phiqs = np.empty(_dynqs.shape, dtype=complex)
-        for qi, q in enumerate(_qpoints):
-            for i in range(instance.structure.Natoms):
-                for j in range(instance.structure.Natoms):
-                    _phiqs[qi, i, j, :, :] = _dynqs[qi, i, j, :, :] * np.sqrt(instance.structure.masses[i] * instance.structure.masses[j])
-        instance.phiR = np.real(mnx.FModules.interpolation.ift_fcq(_phiqs,_qpoints,instance.structure.cell,instance.super_structure.atom_coords,"atomic"))
-        for qi,q in enumerate(_qpoints):
-            instance.DynQs[qi] = instance.get_dynq(q, gauge="lattice")
-        
-        return(instance)
+        phonon = phonopy.load(f"{folder}/phonopy_disp.yaml")
+        masses = phonon.masses / _consts.Ry2AMU
+        instance.structure.masses = masses
+        nat = instance.structure.Natoms
 
-    def distort_structure(self, Q : list, modes : list, mod : list=None) -> "Structure":
+        qpoints = np.array([np.divide(idx, qgrid) for idx in np.ndindex(*qgrid)])
+        instance.Nqpoints = len(qpoints)
+
+        # phonopy gives D(q) in eV/A^2/amu with (atom, cart) superindices; convert it to
+        # mass-weighted force constants Phi(q) with shape [nat, nat, 3, 3] in Ry/bohr^2.
+        phiqs = np.empty([instance.Nqpoints, nat, nat, 3, 3], dtype=complex)
+        mass_factor = np.sqrt(np.outer(masses, masses))[:, :, None, None]
+        for qi, q in enumerate(qpoints):
+            dynq = np.reshape(phonon.get_dynamical_matrix_at_q(q), [nat, 3, nat, 3])
+            dynq = np.moveaxis(dynq * _consts.eVA2RyBohr2 * _consts.Ry2AMU, 1, 2)
+            phiqs[qi] = dynq * mass_factor
+        instance.phiR = np.real(
+            _interpolation.ift_fcq(
+                phiqs, qpoints, instance.structure.cell, instance.super_structure.atom_coords, "atomic"
+            )
+        )
+
+        instance.DynQs = np.empty(instance.Nqirr, dtype=object)
+        instance.qstars = np.empty(instance.Nqirr, dtype=object)
+        for qi, q in enumerate(qpoints):
+            instance.qstars[qi] = np.asarray([q])
+            instance.DynQs[qi] = instance.get_dynq(q, gauge="lattice")
+        return instance
+
+    def distort_structure(self, Q: list, modes: list, mod: list | None = None) -> Structure:
         """
-        A function to generate a distorted structure from a given DynMatrix.
+        Displace the atoms along a combination of phonon modes.
 
         Parameters
         ----------
-        Q : list or np.ndarray
-            The order parameter containing the combination for each of the independent 
-            stars considered for the distortion. If a one dimensional star, and a 3 dimensional
-            star are combined, the format is Q = [np.array([Q1]), np.array([Q2,Q3,Q4])].
-        modes : list or np.ndarray
-            Which modes/stars are considered for the distortion. First index corresponds to the 
-            q-star, and second index to the vibrational mode. The format to consider the first mode
-            of first q-star (1 dimensional), and the second mode of the second q-star (3-dimensional)
-            is modes = [np.array([0,0]), np.array([1,1])]. Note that Q and mode must coincide in
-            the degeneracy of the star and number of Qs.
-        mod : list
-            The size of the supercell for the output structure.
-            Defaults to the size of the qgrid.
+        Q : list of array_like
+            Amplitudes (order parameter) of each q-star taking part in the distortion,
+            one entry per q-point of the star. Combining a one-dimensional and a
+            three-dimensional star reads ``Q = [[Q1], [Q2, Q3, Q4]]``.
+        modes : list of [int, int]
+            ``[star, mode]`` pairs of the modes used for the distortion, in the same
+            order as ``Q``. For the first mode of star 0 and the second mode of star 1:
+            ``modes = [[0, 0], [1, 1]]``.
+        mod : list of int, [3], optional
+            Supercell of the distorted structure. Defaults to ``qgrid``.
 
         Returns
         -------
-        Structure : object
-            Instance containing all the information about the crystalline structure.
+        Structure
+            The distorted supercell.
         """
-
-        if mod == None:
+        if mod is None:
             mod = self.qgrid
 
-        Q = np.asarray(Q)
-        tmp_cell = np.empty([3, 3])
-        for i in range(3):
-            tmp_cell[i, :] = self.structure.cell[i, :] * mod[i]
-        tmp_atom_coords = np.empty([self.structure.Natoms * mod[0] * mod[1] * mod[2], 3])
-        tmp_atom_species = np.empty(
-            [self.structure.Natoms * mod[0] * mod[1] * mod[2], 2], dtype="<U5"
-        )
-        for i in range(mod[0]):
-            for j in range(mod[1]):
-                for k in range(mod[2]):
-                    tmp_atom_coords[
-                        self.structure.Natoms
-                        * (mod[2]*mod[1]*i + mod[2]*j + k) : self.structure.Natoms
-                        * (mod[2]*mod[1]*i + mod[2]*j + k + 1)
-                    ] = self.structure.atom_coords + (
-                        self.structure.cell[0, :] * i
-                        + self.structure.cell[1, :] * j
-                        + self.structure.cell[2, :] * k
-                    )
-                    tmp_atom_species[
-                        self.structure.Natoms
-                        * (mod[2]*mod[1]*i + mod[2]*j + k) : self.structure.Natoms
-                        * (mod[2]*mod[1]*i + mod[2]*j + k + 1)
-                    ] = self.structure.atom_species
-        tmp_disp_list = (self.expand_polvecs(modes=modes, mod=mod))[1]
-        for qs, displacement_instar in enumerate(tmp_disp_list):
-            for i, mode in enumerate(displacement_instar):
-                rs_tmp_displ = np.reshape(mode, tmp_atom_coords.shape)
-                tmp_atom_coords += np.real(Q[qs,i] * rs_tmp_displ)
-        structure = Structure.from_data(tmp_cell, tmp_atom_coords, tmp_atom_species)
-        return structure
-    
+        supercell = self.structure.expand_structure(mod)
+        atom_coords = supercell.atom_coords.copy()
+        _, displacements, _ = self.expand_polvecs(modes=modes, mod=mod)
+        for qs, displacements_instar in enumerate(displacements):
+            for i, displacement in enumerate(displacements_instar):
+                atom_coords += np.real(Q[qs][i] * np.reshape(displacement, atom_coords.shape))
+        return Structure.from_data(supercell.cell, atom_coords, supercell.atom_species)
+
     def info(self) -> None:
-        """
-        Returns the most relevant data of the DynMatrix object concisely.
-        """
+        """Print a summary of the structure and of the q-stars."""
         self.structure.info()
         print("Dynamical information:")
         print(f"\tNumber of stars: {self.Nqirr}")
         for qs in range(self.Nqirr):
-            for qi,q in enumerate(self.DynQs[qs].qpoints):
+            for qi, q in enumerate(self.DynQs[qs].qpoints):
                 if qi == 0:
-                    print("\t\tStar {0:>3}: [{1:14.8f},{2:14.8f},{3:14.8f}]".format(qs,q[0],q[1],q[2]))
+                    print("\t\tStar {0:>3}: [{1:14.8f},{2:14.8f},{3:14.8f}]".format(qs, *q))
                 else:
-                    print("\t\t          [{1:14.8f},{2:14.8f},{3:14.8f}]".format(qs,q[0],q[1],q[2]))
-            if qs != self.Nqirr-1:
+                    print("\t\t          [{0:14.8f},{1:14.8f},{2:14.8f}]".format(*q))
+            if qs != self.Nqirr - 1:
                 print("\n")
-    
-    def expand_polvecs(self, modes : list, mod : list) -> tuple[list, list, np.ndarray]:
+
+    def expand_polvecs(self, modes: list, mod: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Function to expand the polarization vectors out from the primitive cell.
+        Expand polarization vectors from the primitive cell to a supercell.
 
         Parameters
         ----------
-            modes: list or np.ndarray.
-                Which polarization vectors or vibrational modes will be expanded.
-                Example: [[2,0]], which means q-star 2, and vibrational mode 0.
-            mod : list or np.ndarray.
-                Modulation of the expanded polvecs. A typical choice would be the q-grid.
+        modes : list of [int, int]
+            ``[star, mode]`` pairs to expand, e.g. ``[[2, 0]]`` for mode 0 of star 2.
+        mod : list of int, [3]
+            Supercell over which the modes are expanded, typically ``qgrid``.
+
         Returns
         -------
-            polvecs_list : list of np.array.
-                List of np.arrays containing the expanded polarization vectors for the specified 
-                modes in the q-star.
-            displacements_list : list of np.array.
-                List of np.arrays containing the displacemt vectors for the specified 
-                modes in the q-star.
-            exp_masses : np.array.
-                Masses for each atom in the supercell speciefied by mod. 
+        polvecs_list : np.ndarray of np.ndarray, [len(modes)]
+            For each requested mode, the normalized polarization vectors of every
+            q-point of its star, shape [Nqinstar, Nat_sc*3].
+        displacements_list : np.ndarray of np.ndarray, [len(modes)]
+            Same as ``polvecs_list`` divided by the square root of the atomic masses.
+        exp_masses : np.ndarray, [Nat_sc*3]
+            Mass associated with each component of the supercell vectors.
         """
-        exp_masses = np.empty([self.structure.Natoms * mod[0] * mod[1] * mod[2] * 3], complex)
         polvecs_list = np.empty(len(modes), dtype=object)
         displacements_list = np.empty(len(modes), dtype=object)
-        for ii,index in enumerate(modes):
-            polvecs_instar = np.empty([self.DynQs[index[0]].Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
-            displacements_instar = np.empty([self.DynQs[index[0]].Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
-            for qi,q in enumerate(self.DynQs[index[0]].qpoints):
-                for i in range(mod[0]):
-                    for j in range(mod[1]):
-                        for k in range(mod[2]):
-                            polvecs_instar[
-                                qi,
-                                self.structure.Natoms
-                                * 3
-                                * (mod[1] * mod[2] * i + mod[2] * j + k) : self.structure.Natoms
-                                * 3
-                                * (mod[1] * mod[2] * i + mod[2] * j + k + 1)
-                            ] = self.DynQs[index[0]].polvecs[qi, index[1]] * np.exp(
-                                2j
-                                * np.pi
-                                * np.matmul(q,
-                                    np.array([i, j, k]),
-                                )
-                            )
-                            for atom in range(self.structure.Natoms):
-                                exp_masses[
-                                    self.structure.Natoms
-                                    * 3
-                                    * (mod[1] * mod[2] * i + mod[2] * j + k)
-                                    + atom
-                                    * 3 : self.structure.Natoms
-                                    * 3
-                                    * (mod[1] * mod[2] * i + mod[2] * j + k)
-                                    + (atom + 1) * 3
-                                ] = self.structure.masses[atom]
-                polvecs_instar[qi] = polvecs_instar[qi] / np.linalg.norm(polvecs_instar[qi])
-                ##############################################################################
-                ##### The displacements are constructed from already normalized pol vecs #####
-                ##############################################################################
-                for i in range(self.structure.Natoms * mod[0] * mod[1] * mod[2] * 3):
-                    displacements_instar[qi,i] = polvecs_instar[qi,i] / np.sqrt(exp_masses[i])
-            polvecs_list[ii] = polvecs_instar
-            displacements_list[ii] = displacements_instar
-        return polvecs_list, displacements_list, exp_masses
+        for ii, (star, mode) in enumerate(modes):
+            polvecs, displacements, _ = self.DynQs[star]._expand_polvecs([mode], mod)
+            polvecs_list[ii], displacements_list[ii] = polvecs[0], displacements[0]
+        return polvecs_list, displacements_list, _expanded_masses(self.structure.masses, mod)
 
     def get_phiR(self) -> None:
         """
-        Function to compute the real space force constants from the reciprocal space force constants. It 
-        uses a the fortran subroutine mnx.Fmodules.interpolation.ift_fcq for efficiency.
+        Fourier transform the force constants of all q-points to real space.
+
+        Stores the result in ``self.phiR`` with shape [Nat_sc, Nat_sc, 3, 3]. The
+        transform is done by the Fortran routine ``FModules.interpolation.ift_fcq``.
         """
-        phiqs = np.empty([self.Nqpoints,self.structure.Natoms,self.structure.Natoms,3,3], dtype=np.complex128)
-        qpoints = np.empty([self.Nqpoints,3], dtype=np.float128)
-        ii = 0
-        for qs in range(self.Nqirr):
-            for qi in range(self.DynQs[qs].Nqinstar):
-                phiqs[ii] = self.DynQs[qs].phiqs[qi]
-                qpoints[ii] = self.DynQs[qs].qpoints[qi]
-                ii+=1
-        self.phiR = np.real(mnx.FModules.interpolation.ift_fcq(phiqs,qpoints,self.structure.cell,self.super_structure.atom_coords,"lattice"))
-    
-    def get_dynq(self, q : list, gauge : str = "atomic") -> "DynQ":
-        """
-        Function to compute the reciprocal space force constants \Phi(Q). It employs the fortran
-        subroutine mnx.FModules.interpolation.ft_fcr for efficiency.
+        phiqs = np.concatenate([dynq.phiqs for dynq in self.DynQs])
+        qpoints = np.concatenate([dynq.qpoints for dynq in self.DynQs])
+        self.phiR = np.real(
+            _interpolation.ift_fcq(phiqs, qpoints, self.structure.cell, self.super_structure.atom_coords, "lattice")
+        )
+
+    def get_dynq(self, q: list, gauge: str = "atomic") -> "DynQ":
+        r"""
+        Interpolate the force constants :math:`\Phi(q)` to an arbitrary q-point.
 
         Parameters
         ----------
-            q : list or np.ndarray.
-                q-point in fractional units for which the \Phi(Q) is interpolated.
-            gauge : str.
-                Gauge employed in the interpolation. 
-                Supported options (defaults to atomic):
-                    atomic: atomic gauge is employed.
-                    lattice: lattice gauge is employed.
-        Returns
-        -------
-            dynq : DynQ object.
-        """
-        phiq, frequencies, polvecs = mnx.FModules.interpolation.ft_fcr(self.phiR,q,self.structure.masses,self.qgrid,self.structure.cell,self.super_structure.atom_coords,gauge)
-        dynq = DynQ.from_data(self.structure, np.array([q]), np.array([phiq]), np.array([frequencies]), np.array([np.transpose(polvecs)]))
-        return dynq
-    
-    def get_bands(self, k_inpath : np.ndarray, N : int, gauge: str="atomic") -> tuple[np.ndarray, np.ndarray, list]:
-        """
-        Function to complute the phonon spectra in a fine grid.
-        
-        Parameters
-        ----------
-            k_inpath : np.ndarray
-                k-points in fractional units, orginized in pairs defining paths.
-                Example: np.array([[0,0,0],[0.5,0,0]],[[0.5,0,0],[0.5,0,0.5]]) corresponds to a
-                GMA path in a hexagonal unit cell.
-            N : int
-                Number k-points in each of the segments defined in k_inpath.
-            gauge : str. Defaults to "atomic".
-                Gauge employed for the fourier interpolation.
-                Supported options: "atomic" and "lattice".
+        q : array_like, [3]
+            q-point in fractional units.
+        gauge : {"atomic", "lattice"}, optional
+            Gauge of the Fourier interpolation. Defaults to ``"atomic"``.
 
         Returns
         -------
-            bands : np.ndarray. [Nqpoints, Nmodes].
-                Frequency of the vibrational modes in the q-path. Units cm^{-1}.
-            cart_qpath : np.ndarray.
-                Distance between respective q-points in cartesian units for a physical and straightforward
-                visualization. 
-            xticks : list.
-                The values of cart_qpath, where the segements defined in k_inpath start/end.
+        DynQ
+            Single-point star with the interpolated spectrum.
         """
-        k_inpath = np.asarray(k_inpath)
-        qpath=np.empty([len(k_inpath)*(N+1),3])
-        bands = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=np.float64)
-        cart_qpath = np.zeros(len(k_inpath)*(N+1))
-        xticks = [0]
-        for ki,ks in enumerate(k_inpath):
-            dk = (ks[1]-ks[0])
-            cart_qpath[ki*(N+1):(ki+1)*(N+1)] = cart_qpath[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell))*np.arange(0,10+10/N,10/N)
-            xticks.append(cart_qpath[(ki+1)*(N+1)-1])
-            dk = dk
-            qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]
-        for qi,q in enumerate(qpath):
-            dynq = self.get_dynq(q, gauge)
-            bands[qi] = np.real(dynq.frequencies[0])
-            _looking = True
-            for mode in range(len(bands[0,:])):
-                if _looking:
-                    if np.square(dynq.frequencies[0,mode]).min()<0:
-                        bands[qi,mode] = np.real((-1)*np.sqrt(np.abs(np.square(dynq.frequencies[0,mode]))))
-                    else:
-                        _looking = False
+        phiq, eigenvalues, polvecs = self._interpolate(q, gauge)
+        return DynQ.from_data(self.structure, np.array([q]), np.array([phiq]), np.array([eigenvalues]), np.array([polvecs]))
+
+    def get_bands(self, k_inpath: np.ndarray, N: int, gauge: str = "atomic") -> tuple[np.ndarray, np.ndarray, list]:
+        """
+        Compute the phonon dispersion along a path in reciprocal space.
+
+        Parameters
+        ----------
+        k_inpath : array_like, [Nsegments, 2, 3]
+            Start and end points of each path segment in fractional units, e.g.
+            ``[[[0, 0, 0], [0.5, 0, 0]], [[0.5, 0, 0], [0.5, 0, 0.5]]]`` for
+            Gamma-M-A in a hexagonal cell.
+        N : int
+            Number of intervals per segment (each segment has ``N + 1`` points).
+        gauge : {"atomic", "lattice"}, optional
+            Gauge of the Fourier interpolation. Defaults to ``"atomic"``.
+
+        Returns
+        -------
+        bands : np.ndarray, [Nsegments*(N+1), Natoms*3]
+            Frequencies in cm^-1, imaginary ones shown as negative.
+        cart_qpath : np.ndarray, [Nsegments*(N+1)]
+            Accumulated cartesian length along the path, for plotting.
+        xticks : list of float
+            Values of ``cart_qpath`` at the segment boundaries.
+        """
+        qpath, cart_qpath, xticks = self._build_qpath(k_inpath, N)
+        bands = np.empty([len(qpath), self.structure.Natoms * 3], dtype=np.float64)
+        for qi, q in enumerate(qpath):
+            _, eigenvalues, _ = self._interpolate(q, gauge)
+            bands[qi] = _signed_frequencies(_eigenvalues_to_cm(eigenvalues))
         return bands, cart_qpath, xticks
-    
-    def get_bands_with_SF(self, k_inpath : np.ndarray, N : int, Q : list) -> tuple[np.ndarray, np.ndarray, list,  np.ndarray]:
+
+    def get_bands_with_SF(self, k_inpath: np.ndarray, N: int, Q: list) -> tuple[np.ndarray, np.ndarray, list, np.ndarray]:
         """
-        Function to complute the phonon spectra in a fine grid, returning the structure factor calculated
-        in the path Q+k.
-        
-        Parameters
-        ----------
-            k_inpath : np.ndarray
-                k-points in fractional units, orginized in pairs defining paths.
-                Example: np.array([[0,0,0],[0.5,0,0]],[[0.5,0,0],[0.5,0,0.5]]) corresponds to a
-                GMA path in a hexagonal unit cell.
-            N : int
-                Number k-points in each of the segments defined in k_inpath.
-            Q : list of floats.
-                The Q point in fractional units.
-        Returns
-        -------
-            bands : np.ndarray. [Nqpoints, Nmodes].
-                Frequency of the vibrational modes in the q-path. Units cm^{-1}.
-            cart_qpath : np.ndarray.
-                Distance between respective q-points in cartesian units for a physical and straightforward
-                visualization. 
-            xticks : list.
-                The values of cart_qpath, where the segements defined in k_inpath start/end.
-            structure_factor : np.ndarray. [Nqpoints, Nmodes]
-        """
-        k_inpath = np.asarray(k_inpath)
-        qpath=np.empty([len(k_inpath)*(N+1),3])
-        bands = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=np.float64)
-        structure_factor = np.empty([len(k_inpath)*(N+1), self.structure.Natoms*3], dtype=np.float64)
-        cart_qpath = np.zeros(len(k_inpath)*(N+1))
-        xticks = [0]
-        for ki,ks in enumerate(k_inpath):
-            dk = (ks[1]-ks[0])
-            cart_qpath[ki*(N+1):(ki+1)*(N+1)] = cart_qpath[ki*(N+1)-1]+np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell))*np.arange(0,10+10/N,10/N)
-            xticks.append(cart_qpath[(ki+1)*(N+1)-1])
-            dk = dk
-            qpath[ki*(N+1):(ki+1)*(N+1)] = dk[None,:]*np.arange(0,1+1/N,1/N)[:,None]+ks[0]
-        for qi,q in enumerate(qpath):
-            dynq = self.get_dynq(q)
-            bands[qi] = np.real(dynq.frequencies[0])
-            _looking = True
-            for mode in range(len(bands[0,:])):
-                if _looking:
-                    if np.square(dynq.frequencies[0,mode]).min()<0:
-                        bands[qi,mode] = np.real((-1)*np.sqrt(np.abs(np.square(dynq.frequencies[0,mode]))))
-                    else:
-                        _looking = False
-            for mode in range(self.structure.Natoms*3):
-                eps = np.reshape(dynq.displacements[0, mode, :], [self.structure.Natoms, 3])
-                eps1 = np.empty([self.structure.Natoms, 3], dtype=complex)        
-                for atom in range(self.structure.Natoms):
-                    phase = np.exp(2j*np.pi*np.matmul(np.array(_cell.cryst2cart(np.array(q+Q), self.structure.rcell)), self.structure.atom_coords[atom, :]))
-                    eps1[atom, :] = eps[atom, :]*phase
-                s = (np.sum(np.matmul(np.sqrt(2*self.structure._exp_masses)*eps1, np.array(_cell.cryst2cart(np.array(q+Q), self.structure.rcell))), axis=0))
-                structure_factor[qi,mode] = np.real(1/dynq.frequencies[0,mode]*np.conjugate(s)*s)
-        return bands, cart_qpath, xticks, structure_factor
-    
-    def Symmetrize(self, symprec : float = 1e-5, apply_translations : bool = True) -> None:
-        """
-        Function that symmetrizes the force constants, and crystalline structure with the precision
-        specified by symprec.
+        Compute the phonon dispersion and the one-phonon structure factor along a path.
+
+        The structure factor of each mode is evaluated at the momentum ``Q + k``, with
+        ``k`` running along the path and the atomic gauge for the interpolation.
 
         Parameters
         ----------
-            symprec : float.
-                Precision used to identify the symmetry operations with spglib. Check Structure.get_spacegroup()
-                to select the desired resulting space-group.
-                Defaults to 1e-5.
-            apply_translation : bool.
-                If pure translations will be considered in the symmetrization.
-                Defaults to True.
+        k_inpath : array_like, [Nsegments, 2, 3]
+            Start and end points of each path segment in fractional units.
+        N : int
+            Number of intervals per segment (each segment has ``N + 1`` points).
+        Q : array_like, [3]
+            Reciprocal lattice vector in fractional units, e.g. ``[0, 0, 3]``.
+
+        Returns
+        -------
+        bands : np.ndarray, [Nsegments*(N+1), Natoms*3]
+            Frequencies in cm^-1, imaginary ones shown as negative.
+        cart_qpath : np.ndarray, [Nsegments*(N+1)]
+            Accumulated cartesian length along the path, for plotting.
+        xticks : list of float
+            Values of ``cart_qpath`` at the segment boundaries.
+        structure_factor : np.ndarray, [Nsegments*(N+1), Natoms*3]
+            Structure factor of each mode.
+        """
+        qpath, cart_qpath, xticks = self._build_qpath(k_inpath, N)
+        nmodes = self.structure.Natoms * 3
+        masses = self.structure.masses
+        bands = np.empty([len(qpath), nmodes], dtype=np.float64)
+        structure_factor = np.empty([len(qpath), nmodes], dtype=np.float64)
+        for qi, q in enumerate(qpath):
+            _, eigenvalues, polvecs = self._interpolate(q, "atomic")
+            frequencies = _eigenvalues_to_cm(eigenvalues)
+            bands[qi] = _signed_frequencies(frequencies)
+
+            displacements = np.reshape(polvecs / np.sqrt(_expanded_masses(masses)), [nmodes, -1, 3])
+            Qq_cart = _cell.cryst2cart(np.asarray(q + Q), self.structure.rcell)
+            phases = np.exp(2j * np.pi * (self.structure.atom_coords @ Qq_cart))
+            weights = (phases * np.sqrt(2 * masses))[None, :, None]
+            s = np.einsum("man,n->m", weights * displacements, Qq_cart)
+            structure_factor[qi] = np.real(np.conjugate(s) * s / frequencies)
+        return bands, cart_qpath, xticks, structure_factor
+
+    def Symmetrize(self, symprec: float = 1e-5, apply_translations: bool = True) -> None:
+        """
+        Symmetrize the crystal structure and the force constants.
+
+        The structure is symmetrized with spglib, and the real-space force constants with
+        QuantumESPRESSO's routines (permutation, pure translations and space group). The
+        dynamical matrices of every q-star are then recomputed from them.
+
+        Parameters
+        ----------
+        symprec : float, optional
+            Tolerance used by spglib to find the symmetry operations; see
+            ``Structure.get_spacegroup()`` to choose the target space group.
+            Defaults to 1e-5.
+        apply_translations : bool, optional
+            Whether to impose invariance under the pure translations of the supercell.
+            Defaults to True.
         """
         self.structure.Symmetrize(symprec)
         self.super_structure = self.structure.expand_structure(self.qgrid)
         self.SetupFromSPGLIB(symprec=symprec)
-        tmp_phiR = np.empty([self.super_structure.Natoms*3, self.super_structure.Natoms*3])
-        for a in range(self.super_structure.Natoms):
-            for b in range(self.super_structure.Natoms):
-                tmp_phiR[a*3:(a+1)*3,b*3:(b+1)*3] = self.phiR[a,b,:,:]
 
-        # Apply the Permutation symmetry
-        tmp_phiR[:,:] = 0.5 * (tmp_phiR + tmp_phiR.T)
-        # First lets recall that the fortran subroutines
-        # Takes the input as (3,3,nat,nat)
-        new_phiR = np.zeros( (3,3, self._QE_nat, self._QE_nat), dtype = np.double, order ="F")
-        for i in range(self._QE_nat):
-            for j in range(self._QE_nat):
-                new_phiR[:, :, i, j] = tmp_phiR[3*i : 3*(i+1), 3*j : 3*(j+1)]
-        # Apply the translations
+        # Permutation symmetry Phi_ab^ij = Phi_ba^ji.
+        phiR = 0.5 * (self.phiR + self.phiR.transpose(1, 0, 3, 2))
+
+        # The Fortran routines work in place on arrays shaped (3, 3, nat, nat).
+        fc = np.array(phiR.transpose(2, 3, 0, 1), dtype=np.double, order="F")
         if apply_translations:
-            # Check that the translations have been setted up
-            assert len(np.shape(self._QE_translations_irt)) == 2, "Error, symmetries not setted up to work in the supercell"
-            symph.trans_v2(new_phiR, self._QE_translations_irt)
-        # Apply the symmetrization
-        symph.sym_v2(new_phiR, self._QE_at, self._QE_bg, self._QE_s, self._QE_irt, self._QE_nsym)
-        # Return back
-        for i in range(self._QE_nat):
-            for j in range(self._QE_nat):
-                tmp_phiR[3*i : 3*(i+1), 3*j : 3*(j+1)] = new_phiR[:, :, i, j]
+            assert np.ndim(self._QE_translations_irt) == 2, "Error, symmetries not set up to work in the supercell"
+            symph.trans_v2(fc, self._QE_translations_irt)
+        symph.sym_v2(fc, self._QE_at, self._QE_bg, self._QE_s, self._QE_irt, self._QE_nsym)
+        self.phiR[...] = fc.transpose(2, 3, 0, 1)
 
-        for a in range(self.super_structure.Natoms):
-            for b in range(self.super_structure.Natoms):
-                self.phiR[a,b,:,:] = tmp_phiR[a*3:(a+1)*3,b*3:(b+1)*3]
-        for si,star in enumerate(self.qstars):
-            for qi,q in enumerate(star):
-                phiq, frequencies, polvecs = mnx.FModules.interpolation.ft_fcr(self.phiR,q,self.structure.masses,self.qgrid,self.structure.cell,self.super_structure.atom_coords,"lattice")
-                dynq = DynQ.from_data(self.structure, np.array(self.qstars[qi]), np.array([phiq]), np.array([frequencies]), np.array([np.transpose(polvecs)]))
-                self.DynQs[si].phiqs[qi] = dynq.phiqs[0]
-                self.DynQs[si].dynqs[qi] = dynq.dynqs[0]
-                self.DynQs[si].frequencies[qi] = dynq.frequencies[0]
-                self.DynQs[si].polvecs[qi] = dynq.polvecs[0]
-                self.DynQs[si].displacements[qi] = dynq.displacements[0]
-        
-    def SetupFromSPGLIB(self, symprec : float) -> None:
+        for si, star in enumerate(self.qstars):
+            dynq = self.DynQs[si]
+            for qi, q in enumerate(star):
+                phiq, eigenvalues, polvecs = self._interpolate(q, "lattice")
+                dynq.phiqs[qi] = phiq
+                dynq.dynqs[qi] = phiq / np.sqrt(np.outer(self.structure.masses, self.structure.masses))[:, :, None, None]
+                dynq.frequencies[qi] = _eigenvalues_to_cm(eigenvalues)
+                dynq.polvecs[qi] = polvecs
+                dynq.displacements[qi] = polvecs / np.sqrt(_expanded_masses(self.structure.masses))
+
+    def SetupFromSPGLIB(self, symprec: float) -> None:
         """
-        Prepares the DynMatrix objects auxiliary parameters self._QE... for symmetrization of
-        force-constants via QuantumESPRESSO's symmetrization module.
+        Prepare the symmetry data needed by QuantumESPRESSO's symmetrization routines.
+
+        Fills the auxiliary ``self._QE_*`` attributes (rotations, atom mappings, pure
+        translations...) from the spglib symmetries of the supercell.
 
         Parameters
         ----------
-            symprec : float
-                Precision used to identify the symmetry operations with spglib. Check Structure.get_spacegroup()
-                to select the desired resulting space-group.
-         """
-        # Get the symmetries
+        symprec : float
+            Tolerance used by spglib to find the symmetry operations.
+        """
         spg_syms = spglib.get_symmetry(self.super_structure.get_spglib_cell(), symprec)
         symmetries = _classify.GetSymmetriesFromSPGLIB(spg_syms)
+        nat = self.super_structure.Natoms
 
-        self._QE_nat = self.super_structure.Natoms
-        self._QE_s = np.zeros( (3, 3, 48) , dtype = np.intc, order = "F")
-        self._QE_s_cart = np.zeros( (3, 3, 48) , dtype = np.float64, order = "F")
-        self._QE_s_inv_cart = np.zeros( (3, 3, 48) , dtype = np.float64, order = "F")
-        self._QE_irt = np.zeros((48, self.super_structure.Natoms), dtype = np.intc, order = "F")
-        self._QE_invs = np.zeros( (48), dtype = np.intc, order = "F")
-        self._QE_at = np.zeros( (3,3), dtype = np.float64, order = "F")
-        self._QE_bg = np.zeros( (3,3), dtype = np.float64, order = "F")
+        self._QE_nat = nat
+        self._QE_s = np.zeros((3, 3, 48), dtype=np.intc, order="F")
+        self._QE_s_cart = np.zeros((3, 3, 48), dtype=np.float64, order="F")
+        self._QE_s_inv_cart = np.zeros((3, 3, 48), dtype=np.float64, order="F")
+        self._QE_irt = np.zeros((48, nat), dtype=np.intc, order="F")
+        self._QE_invs = np.zeros(48, dtype=np.intc, order="F")
+        self._QE_at = np.asfortranarray(self.super_structure.cell.T, dtype=np.float64)
+        self._QE_bg = np.asfortranarray(self.super_structure.rcell.T, dtype=np.float64)
 
-        bg = self.super_structure.rcell
-        for i in range(3):
-            for j in range(3):
-                self._QE_at[i,j] = self.super_structure.cell[j,i]
-                self._QE_bg[i,j] = bg[j,i]
-
-        # Check how many point group symmetries do we have
+        # spglib lists the point-group operations once per pure translation; the
+        # point group ends where the first rotation appears again.
         n_syms = 0
         for i, sym in enumerate(symmetries):
-            # Extract the rotation and the fractional translation
-            rot = sym[:,:3]
-            rot_cart = _classify.convert_matrix_cart_cryst2(rot, self.super_structure.cell, cryst_to_cart = True)
-            # Check if the rotation is equal to the first one
-            if np.sum( (rot - symmetries[0][:,:3])**2 ) < 0.1 and n_syms == 0 and i > 0:
-                # We got all the rotations
-                n_syms = i 
+            rot = sym[:, :3]
+            if i > 0 and np.sum((rot - symmetries[0][:, :3]) ** 2) < 0.1:
+                n_syms = i
                 break
-                
-            # Extract the point group
-            if n_syms == 0:
-                self._QE_s[:,:, i] = rot.T
-                self._QE_s_cart[:,:, i] = rot_cart
-                self._QE_s_inv_cart[:,:, i] = rot_cart.T
-                # Get the IRT (Atoms mapping using symmetries)
-                irt = _classify.GetIRT(self.super_structure, sym)
-                self._QE_irt[i, :] = irt + 1 #Py to Fort
-        
+            rot_cart = _classify.convert_matrix_cart_cryst2(rot, self.super_structure.cell, cryst_to_cart=True)
+            self._QE_s[:, :, i] = rot.T
+            self._QE_s_cart[:, :, i] = rot_cart
+            self._QE_s_inv_cart[:, :, i] = rot_cart.T
+            self._QE_irt[i, :] = _classify.GetIRT(self.super_structure, sym) + 1  # Fortran indexing
         if n_syms == 0:
             n_syms = len(symmetries)
-        
-        # From the point group symmetries, get the supercell
-        n_supercell = len(symmetries) // n_syms
-        self._QE_translation_nr = n_supercell
+
+        self._QE_translation_nr = len(symmetries) // n_syms
         self._QE_nsymq = n_syms
         self._QE_nsym = n_syms
 
-        self._QE_translations_irt = np.zeros((self.super_structure.Natoms, self.Nqpoints), dtype = np.intc, order = "F")
-        self._QE_translations = np.zeros((3, self.Nqpoints), dtype = np.double, order = "F")
-
-
-        # Now extract the translations
+        self._QE_translations_irt = np.zeros((nat, self.Nqpoints), dtype=np.intc, order="F")
+        self._QE_translations = np.zeros((3, self.Nqpoints), dtype=np.double, order="F")
         for i in range(self.Nqpoints):
             sym = symmetries[i * n_syms]
-            # Check if the symmetries are correctly setup
+            assert np.sum((np.eye(3) - sym[:, :3]) ** 2) < 0.5, (
+                "Error, symmetries are not correctly ordered. They must always start with the identity.\n"
+                f"N_syms = {n_syms}; N = {i * n_syms}; SYM = {sym}"
+            )
+            self._QE_translations_irt[:, i] = _classify.GetIRT(self.super_structure, sym) + 1
+            self._QE_translations[:, i] = sym[:, 3]
 
-            I = np.eye(3)
-            ERROR_MSG="""
-            Error, symmetries are not correctly ordered.
-            They must always start with the identity.
-
-            N_syms = {}; N = {}; SYM = {}
-            """.format(n_syms,i*n_syms, sym)
-            assert np.sum( (I - sym[:,:3])**2) < 0.5, ERROR_MSG
-
-            # Get the irt for the translation (and the translation)
-            irt = _classify.GetIRT(self.super_structure, sym)
-            self._QE_translations_irt[:, i] = irt + 1
-            self._QE_translations[:, i] = sym[:,3]
-
-        # For each symmetry operation, assign the inverse
         self._QE_invs[:] = _classify.get_invs(self._QE_s, self._QE_nsym)
 
-    def change_cell(self, cell : np.ndarray) -> None:
+    def change_cell(self, cell: np.ndarray) -> None:
         """
-        This function changes the cell manually, moving the atomic coordinates by fixing the fractional coordinates.
+        Replace the unit cell, keeping the fractional atomic coordinates fixed.
 
         Parameters
         ----------
-            cell : np.ndarray. [3,3].
-                New unit-cell.
+        cell : np.ndarray, [3, 3]
+            New unit cell in Angstrom, one lattice vector per row.
         """
-        self.structure.atom_coords = _cell.cryst2cart(_cell.cart2cryst(self.structure.atom_coords,self.structure.cell),cell)
+        self.structure.atom_coords = _cell.cryst2cart(_cell.cart2cryst(self.structure.atom_coords, self.structure.cell), cell)
         self.structure.cell = cell
         self.structure.rcell = _cell.get_rcell(self.structure.cell)
-        self._alat = np.linalg.norm(self.structure.cell[0,:])/_consts.bohr2angstroms
+        self._alat = np.linalg.norm(self.structure.cell[0, :]) / _consts.bohr2angstroms
         for dynq in self.DynQs:
             dynq.structure = self.structure
             dynq._alat = self._alat
 
     def copy(self) -> "DynMatrix":
-        """
-        Generates a copy of the DynMatrix object.
-        """
+        """Return a deep copy of the object."""
         return copy.deepcopy(self)
 
-    def write(self, file : str) -> None:
+    def write(self, file: str) -> None:
         """
-        This function writes each of the DynQs in QuantumESPRESSO format.
-        """
-        for si, star in enumerate(self.qstars):
-            self.DynQs[si].write(f"{file}{si+1}")
+        Write every q-star in QuantumESPRESSO format as ``{file}1`` ... ``{file}Nqirr``.
 
-    def to_CC(self):
-        """
-        Dirty interface with CC, writing the dyn files in qe format, and reading
-        them from scratch with CC.
-        """
-        prefix = "./tmp_dyns2CC.dyn"
-        self.write(prefix)
-        
-        try:
-            dyn_CC = CC.Phonons.Phonons(prefix, nqirr=self.Nqirr)
-        finally:
-            # Safely remove all temporary dyn files (dyn1, dyn2, etc.) created during write
-            for filepath in glob.glob(f"{prefix}*"):
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-        return dyn_CC
-
-    def get_Pmn(self, symprec=1e-5):
-        """
-        This function construct the P matrix.
-        
         Parameters
         ----------
-
-        Returns
-        -------
-            - Pmn: np.ndarray
-                Pmn matrix. Dimension [Nmode,Nmode,Nsym_lg]
+        file : str
+            Prefix of the output files.
         """
-        mapping, map_uc, rot_cart = _cell.map_singlet(self.to_CC(), symprec=symprec)
+        for si, dynq in enumerate(self.DynQs):
+            dynq.write(f"{file}{si + 1}")
 
-        nmodes = self.structure.Natoms*3
+    def to_CC(self) -> "CC.Phonons.Phonons":
+        """
+        Convert to a CellConstructor ``Phonons`` object.
+
+        The dyn files are written to a temporary folder and read back with CellConstructor.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = f"{tmp}/dyn"
+            self.write(prefix)
+            return CC.Phonons.Phonons(prefix, nqirr=self.Nqirr)
+
+    def get_Pmn(self, symprec: float = 1e-5) -> None:
+        r"""
+        Build the representation matrices of the little group in the phonon basis.
+
+        For every q-star stores ``DynQ.Pmn`` with
+        :math:`P_{\mu\nu}(S) = \langle e_\mu | S | e_\nu \rangle` for the operations ``S``
+        of the little group of q, restricted to pairs of degenerate modes (other
+        entries are zero). Use :meth:`DynQ.compute_traces` afterwards to get the characters.
+
+        Parameters
+        ----------
+        symprec : float, optional
+            Tolerance used to find the symmetry operations. Defaults to 1e-5.
+        """
+        mapping, _, rot_cart = _cell.map_singlet(self.to_CC(), symprec=symprec)
+
+        nmodes = self.structure.Natoms * 3
         nat_sc = self.super_structure.Natoms
-        nsym = rot_cart.shape[0]
-        rot_pol_vec = np.empty([nat_sc,3], dtype=np.complex128)
-        for qi, dynq in enumerate(self.DynQs):
-            dynq.Pmn = np.zeros([nmodes,nmodes,len(dynq.lg_idx)], dtype = np.complex128)
-            expanded_polvecs = np.empty([nmodes,nat_sc*3], dtype=np.complex128)
-            for mu in range(nmodes):
-                expanded_polvecs[mu,:] = dynq._expand_polvecs([mu],self.qgrid)[0][0][0]
-            for li,lgi in enumerate(dynq.lg_idx):
-                isym = lgi
-                for mu in range(nmodes):
-                    for nu in range(nmodes):
-                        if dynq.degs[mu,nu]:
-                            for a in range(nat_sc):
-                                b = mapping[a,isym]
-                                for alpha in range(3):
-                                    ref_pol_vec = np.reshape(expanded_polvecs[nu],[nat_sc,3])
-                                    rot_pol_vec[b, alpha] = np.matmul(rot_cart[isym,alpha,:],np.transpose(ref_pol_vec[a,:]))
-                                dynq.Pmn[mu,nu,li] = np.matmul(np.conjugate(expanded_polvecs[mu]),np.transpose(np.reshape(rot_pol_vec, [nat_sc*3])))
+        for dynq in self.DynQs:
+            expanded = dynq._expand_polvecs(range(nmodes), self.qgrid)[0]
+            polvecs = np.array([expanded[mu][0] for mu in range(nmodes)])  # first q of the star
+            polvecs_atoms = np.reshape(polvecs, [nmodes, nat_sc, 3])
+            dynq.Pmn = np.zeros([nmodes, nmodes, len(dynq.lg_idx)], dtype=np.complex128)
+            for li, isym in enumerate(dynq.lg_idx):
+                rotated = np.zeros_like(polvecs_atoms)
+                rotated[:, mapping[:, isym], :] = polvecs_atoms @ rot_cart[isym].T
+                P = np.conjugate(polvecs) @ np.reshape(rotated, [nmodes, -1]).T
+                dynq.Pmn[:, :, li] = np.where(dynq.degs, P, 0)
+
+    def _interpolate(self, q: np.ndarray, gauge: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Fourier interpolate the force constants to ``q`` and diagonalize them.
+
+        Returns the force constants [Natoms, Natoms, 3, 3], the eigenvalues of the
+        dynamical matrix [Natoms*3] (Ry units, ascending) and the eigenvectors as rows
+        [Natoms*3, Natoms*3].
+        """
+        phiq, eigenvalues, polvecs = _interpolation.ft_fcr(
+            self.phiR, q, self.structure.masses, self.qgrid, self.structure.cell, self.super_structure.atom_coords, gauge
+        )
+        return phiq, eigenvalues, np.transpose(polvecs)
+
+    def _build_qpath(self, k_inpath: np.ndarray, N: int) -> tuple[np.ndarray, np.ndarray, list]:
+        """
+        Sample the segments of ``k_inpath`` with ``N + 1`` points each.
+
+        Returns the fractional q-points [Nsegments*(N+1), 3], the accumulated cartesian
+        path length (reciprocal cell without 2*pi, scaled by 10, i.e. nm^-1) and the
+        path length at the segment boundaries.
+        """
+        k_inpath = np.asarray(k_inpath, dtype=float)
+        t = np.linspace(0, 1, N + 1)
+        qpath = np.empty([len(k_inpath) * (N + 1), 3])
+        cart_qpath = np.zeros(len(k_inpath) * (N + 1))
+        xticks = [0]
+        for ki, (k_start, k_end) in enumerate(k_inpath):
+            segment = slice(ki * (N + 1), (ki + 1) * (N + 1))
+            dk = k_end - k_start
+            offset = cart_qpath[ki * (N + 1) - 1] if ki > 0 else 0
+            cart_qpath[segment] = offset + np.linalg.norm(_cell.cryst2cart(dk, self.structure.rcell)) * 10 * t
+            xticks.append(cart_qpath[segment][-1])
+            qpath[segment] = k_start + t[:, None] * dk[None, :]
+        return qpath, cart_qpath, xticks
+
 
 class DynQ:
     """
-    Subclass of DynMatrix, containing info related to an individual q-star at reciprocal
-    space.
+    Dynamical matrices of a single q-star.
+
+    Build instances with :meth:`from_file` (one QuantumESPRESSO dyn file) or
+    :meth:`from_data`.
+
+    Attributes
+    ----------
+    structure : Structure
+        Primitive cell.
+    Nqinstar : int
+        Number of q-points in the star.
+    qpoints : np.ndarray, [Nqinstar, 3]
+        q-points in fractional units.
+    qpoints_cart : np.ndarray, [Nqinstar, 3]
+        q-points in cartesian units (Angstrom^-1, without 2*pi).
+    phiqs : np.ndarray, [Nqinstar, Natoms, Natoms, 3, 3]
+        Force constants at each q-point (Ry/bohr^2).
+    dynqs : np.ndarray, [Nqinstar, Natoms, Natoms, 3, 3]
+        Mass-scaled force constants, i.e. the dynamical matrices.
+    frequencies : np.ndarray, [Nqinstar, Natoms*3], complex
+        Phonon frequencies in cm^-1, sorted in ascending order of the eigenvalue.
+        Imaginary frequencies have a vanishing real part.
+    polvecs : np.ndarray, [Nqinstar, Natoms*3, Natoms*3]
+        Polarization vectors (eigenvectors of the dynamical matrix), indexed as
+        [q-point, mode, 3*atom + cartesian].
+    displacements : np.ndarray, [Nqinstar, Natoms*3, Natoms*3]
+        Polarization vectors divided by the square root of the atomic masses.
+    lg_idx : list of int
+        Indices of the spglib symmetries of the little group of the star.
+    degs : np.ndarray, [Natoms*3, Natoms*3], bool
+        ``degs[mu, nu]`` is True when modes ``mu`` and ``nu`` are degenerate.
     """
+
     @classmethod
-    def from_file(cls, file : str) -> "DynQ":
+    def from_file(cls, file: str) -> "DynQ":
         """
-        Classmethod of DynQ subclass. Reads the dynamical matrix of the q-star from an individual
-        QuantumESPRESSO dyn file.
+        Read the dynamical matrices of a q-star from a QuantumESPRESSO dyn file.
 
         Parameters
         ----------
-            file : str
-                Name of the espresso dyn matrix.
+        file : str
+            Name of the dyn file.
+
+        Returns
+        -------
+        DynQ
+            The q-star, diagonalized.
         """
         instance = cls()
         instance.structure = Structure.from_file(file, format="dyn")
-        data = (open(file, "r")).readlines()
-        instance._alat = float((data[2].split())[3]) * _consts.bohr2angstroms
-        data1 = []
-        for i in range(len(data)):
-            try:
-                if data[i].split()[0] != "\n":
-                    data1.append(data[i])
-            except:
-                None
-        data = data1
-        instance.Nqinstar = -1
-        for i in range(len(data)):
-            if data[i].split()[0] == "q":
-                instance.Nqinstar += 1
-        instance.qpoints = np.empty([instance.Nqinstar, 3], dtype=float)
-        instance.qpoints_cart = np.empty([instance.Nqinstar, 3], dtype=float)
-        i = 3
-        instance.phiqs = np.empty(
-            [instance.Nqinstar, instance.structure.Natoms, instance.structure.Natoms, 3, 3], dtype=complex
-        )
-        for q_index in range(instance.Nqinstar):
-            while (data[i][:]).split()[0] != "q":
-                i += 1
-            instance.qpoints_cart[q_index] = np.array([(data[i][:]).split()[3:6]])
-            instance.qpoints_cart[q_index] = instance.qpoints_cart[q_index]/instance._alat
-            instance.qpoints[q_index] = _cell.cart2cryst(instance.qpoints_cart[q_index], instance.structure.rcell)
-            i += 2
-            for n1 in range(instance.structure.Natoms):
-                for n2 in range(instance.structure.Natoms):
-                    for n3 in range(3):
-                        instance.phiqs[q_index, n1, n2, n3, 0] = complex(
-                            float((data[i + n3].split())[0]),
-                            float((data[i + n3].split())[1]),
-                        )
-                        instance.phiqs[q_index, n1, n2, n3, 1] = complex(
-                            float((data[i + n3].split())[2]),
-                            float((data[i + n3].split())[3]),
-                        )
-                        instance.phiqs[q_index, n1, n2, n3, 2] = complex(
-                            float((data[i + n3].split())[4]),
-                            float((data[i + n3].split())[5]),
-                        )
-                    i += 4
-        instance.polvecs = np.empty(
-            [instance.Nqinstar, instance.structure.Natoms * 3, instance.structure.Natoms * 3], complex
-        )
-        instance.frequencies = np.empty([instance.Nqinstar, instance.structure.Natoms * 3], complex)
-        instance.displacements = np.empty(
-            [instance.Nqinstar, instance.structure.Natoms * 3, instance.structure.Natoms * 3], complex
-        )
+        nat = instance.structure.Natoms
+
+        with open(file, "r") as f:
+            lines = [line.split() for line in f]
+        instance._alat = float(lines[2][3]) * _consts.bohr2angstroms
+
+        # Each q-point starts with a "q = ( qx qy qz )" line followed by nat*nat blocks
+        # of an "i j" header and 3 rows of (re, im) pairs. The last "q" line belongs
+        # to the diagonalization section and is skipped.
+        tokens = [line for line in lines if line]
+        q_rows = [i for i, line in enumerate(tokens) if line[0] == "q"][:-1]
+        instance.Nqinstar = len(q_rows)
+        instance.qpoints_cart = np.array([tokens[i][3:6] for i in q_rows], dtype=float) / instance._alat
+        instance.qpoints = _cell.cart2cryst(instance.qpoints_cart, instance.structure.rcell)
+        instance.phiqs = np.empty([instance.Nqinstar, nat, nat, 3, 3], dtype=complex)
+        for qi, row in enumerate(q_rows):
+            block = tokens[row + 1 : row + 1 + 4 * nat * nat]
+            values = np.array([line for k, line in enumerate(block) if k % 4], dtype=np.float64)
+            instance.phiqs[qi] = np.reshape(values.view(np.complex128), [nat, nat, 3, 3])  # (re, im) pairs
+
         instance.dynqs = instance._phis2dyns()
+        instance.frequencies = np.empty([instance.Nqinstar, nat * 3], dtype=complex)
+        instance.polvecs = np.empty([instance.Nqinstar, nat * 3, nat * 3], dtype=complex)
+        instance.displacements = np.empty([instance.Nqinstar, nat * 3, nat * 3], dtype=complex)
         for qi in range(instance.Nqinstar):
-            instance.frequencies[qi,:], instance.polvecs[qi,:], instance.displacements[qi,:] = instance._diagdynq(qi)
-        
+            instance.frequencies[qi], instance.polvecs[qi], instance.displacements[qi] = instance._diagdynq(qi)
         instance.frequencies = np.sqrt(instance.frequencies) * _consts.Ry2cm
 
-        # Post-processing:
-        instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0]) # All q-points have the same lg.
+        instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0])  # Same for the whole star.
         instance._find_degs()
         return instance
-    
+
     @classmethod
-    def from_data(cls, structure : Structure, qpoints : np.ndarray, phiqs : np.ndarray, frequencies : np.ndarray, polvecs : np.ndarray) -> "DynQ":
+    def from_data(cls, structure: Structure, qpoints: np.ndarray, phiqs: np.ndarray, frequencies: np.ndarray, polvecs: np.ndarray) -> "DynQ":
         """
-        Classmethod of DynQ. Generates a DynQ object from data.
+        Build a q-star from already diagonalized data.
 
         Parameters
         ----------
-            structure : Structure object.
-                Structure of the system.
-            qpoints : np.ndarray. [Nqinstar, 3].
-                q-points in the star. Fractional units.
-            phiqs : np.ndarray. [Nqinstar, Natoms, Natoms, 3, 3].
-                Force constants at reciprocal space. Espresso units.
-            frequencies : np.ndarray. [Nqinstar, Natoms*3].
-                Eigenvalues of the dynamical matrix for each of the q-points in the star. Units cm^{-1}.
-            polvecs : np.ndarray. [Nqinstar, Natoms*3, Natoms*3].
-                Eigenvectros of the dynamical matrix for each of the q-points in the star. The first
-                dimension corresonds to the q-point, the second to the vibrational mode, and the third
-                to the combined a:atom, alpha:cart_index superindex.
+        structure : Structure
+            Primitive cell.
+        qpoints : np.ndarray, [Nqinstar, 3]
+            q-points of the star in fractional units.
+        phiqs : np.ndarray, [Nqinstar, Natoms, Natoms, 3, 3]
+            Force constants at each q-point (Ry/bohr^2).
+        frequencies : np.ndarray, [Nqinstar, Natoms*3]
+            Eigenvalues of the dynamical matrix (squared frequencies, Ry units), as
+            returned by ``FModules.interpolation.ft_fcr``. They are converted to cm^-1.
+        polvecs : np.ndarray, [Nqinstar, Natoms*3, Natoms*3]
+            Eigenvectors of the dynamical matrix, indexed as
+            [q-point, mode, 3*atom + cartesian].
+
+        Returns
+        -------
+        DynQ
+            The q-star.
         """
         instance = cls()
-        instance.structure = structure        
-        instance._alat = np.linalg.norm(instance.structure.cell[0,:])
+        instance.structure = structure
+        instance._alat = np.linalg.norm(instance.structure.cell[0, :])
         instance.qpoints = qpoints
         instance.Nqinstar = qpoints.shape[0]
-        instance.qpoints_cart = np.empty([instance.Nqinstar, 3], dtype=float)
-        for q_index in range(instance.Nqinstar):
-            instance.qpoints_cart[q_index] = _cell.cryst2cart(instance.qpoints[q_index], instance.structure.rcell)
+        instance.qpoints_cart = np.atleast_2d(_cell.cryst2cart(qpoints, structure.rcell))
         instance.phiqs = phiqs
         instance.dynqs = instance._phis2dyns()
-        instance.polvecs = np.empty([instance.Nqinstar,instance.structure.Natoms*3,instance.structure.Natoms*3], dtype=np.complex128)
-        instance.displacements = np.empty([instance.Nqinstar,instance.structure.Natoms*3,instance.structure.Natoms*3], dtype=np.complex128)
-        instance.frequencies = np.empty([instance.Nqinstar,instance.structure.Natoms*3], dtype=np.complex128)
+        instance.frequencies = np.sqrt(np.asarray(frequencies, dtype=np.complex128)) * _consts.Ry2cm
+        instance.polvecs = np.asarray(polvecs, dtype=np.complex128)
+        instance.displacements = instance.polvecs / np.sqrt(_expanded_masses(structure.masses))
 
-        for qi in range(instance.Nqinstar):
-            for a in range(structure.Natoms):
-                instance.displacements[qi,:] = polvecs[qi]/np.sqrt(instance.structure.masses[a])
-            instance.frequencies[qi,:], instance.polvecs[qi,:] = frequencies[qi], polvecs[qi]
-        
-        instance.frequencies = np.sqrt(instance.frequencies) * _consts.Ry2cm
-
-        # Post-processing:
-        instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0]) # All q-points have the same lg.
+        instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0])  # Same for the whole star.
         instance._find_degs()
         return instance
 
-    def _phis2dyns(self) -> None:
-        """
-        This function mass normalizes the force contants to obtain the real dynamical matrix, which
-        is later diagonalized.
-        """
-        dynqs = np.empty(
-            [self.Nqinstar, self.structure.Natoms, self.structure.Natoms, 3, 3], dtype=complex
-        )
-        for qi, phiq in enumerate(self.phiqs):
-            for n1 in range(self.structure.Natoms):
-                for n2 in range(self.structure.Natoms):
-                    dynqs[qi, n1, n2, :, :] = phiq[n1, n2, :, :] / np.sqrt(self.structure.masses[n1] * self.structure.masses[n2])
-        return dynqs
+    def _phis2dyns(self) -> np.ndarray:
+        """Return the dynamical matrices, i.e. ``phiqs`` divided by sqrt(m_a m_b)."""
+        masses = self.structure.masses
+        return self.phiqs / np.sqrt(np.outer(masses, masses))[None, :, :, None, None]
 
-    def _diagdynq(self, qi : int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _diagdynq(self, qi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        This function diagonalizes the dynamical matrix, and orders from low tho high frequency the 
-        vibrational spectra.
-        
-        Parameters
-        ----------
-            qi : int.
-                The q-id for the q-point in the star to be diagonalized.
+        Diagonalize the dynamical matrix of the ``qi``-th q-point of the star.
+
         Returns
         -------
-            frequencies : np.ndarray. [Natoms*3]
-                Eigenvalues of the dynamical matrix.
-            polvecs : np.ndarray. [Natoms*3, Natoms*3]
-                Eigenvectors of the dynamical matrix.
-            displacements : np.ndarray.
-                Mass renormalized eigenvalues of the dynamical matrix.
+        eigenvalues : np.ndarray, [Natoms*3]
+            Eigenvalues (squared frequencies, Ry units) in ascending order.
+        polvecs : np.ndarray, [Natoms*3, Natoms*3]
+            Eigenvectors as rows.
+        displacements : np.ndarray, [Natoms*3, Natoms*3]
+            Eigenvectors divided by the square root of the atomic masses.
         """
-        D = np.empty([self.structure.Natoms*3, self.structure.Natoms*3], dtype=complex)
-        for i in range(self.structure.Natoms*3):
-            for j in range(self.structure.Natoms*3):
-                n1 = i // 3
-                n2 = j // 3
-                n3 = i % 3
-                n4 = j % 3
-                D[i, j] = self.dynqs[qi,n1, n2, n3, n4]
-        frequencies, polvecs = np.linalg.eig(D)
-        displacements = np.empty(polvecs.shape, dtype = np.complex128)
-        for mode in range(self.structure.Natoms * 3):
-            for atom in range(self.structure.Natoms):
-                i = 3 * atom
-                displacements[mode, i:i+3] = polvecs[mode, i:i+3] / np.sqrt(self.structure.masses[atom])
-        frequencies, polvecs, displacements = self._reorder(frequencies, polvecs, displacements)
-        return (frequencies, polvecs, displacements)
-    
-    def _reorder(self, tmp_frequencies : np.ndarray, tmp_polvecs : np.ndarray, tmp_displacements : np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        nmodes = self.structure.Natoms * 3
+        D = self.dynqs[qi].transpose(0, 2, 1, 3).reshape(nmodes, nmodes)
+        eigenvalues, eigenvectors = np.linalg.eig(D)
+        return self._reorder(eigenvalues, eigenvectors)
+
+    def _reorder(self, eigenvalues: np.ndarray, eigenvectors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        This function reorders the phonon spectra from low to high frequencies.
+        Sort the spectrum in ascending order of the eigenvalues.
 
         Parameters
         ----------
-            tmp_frequencies : np.ndarray. [Natoms*3]
-                Eigenvalues of the dynamical matrix.
-            tmp_polvecs : np.ndarray. [Natoms*3, Natoms*3]
-                Eigenvectors of the dynamical matrix.
-            tmp_displacements : np.ndarray.
-                Mass renormalized eigenvalues of the dynamical matrix.
+        eigenvalues : np.ndarray, [Natoms*3]
+            Eigenvalues of the dynamical matrix.
+        eigenvectors : np.ndarray, [Natoms*3, Natoms*3]
+            Eigenvectors as columns, as returned by ``np.linalg.eig``.
+
         Returns
         -------
-            frequencies : np.ndarray. [Natoms*3]
-                Reordered eigenvalues of the dynamical matrix.
-            polvecs : np.ndarray. [Natoms*3, Natoms*3]
-                Reordered eigenvectors of the dynamical matrix.
-            displacements : np.ndarray.
-                Reordered mass renormalized eigenvalues of the dynamical matrix.
+        eigenvalues, polvecs, displacements
+            Sorted eigenvalues, eigenvectors as rows and mass-scaled eigenvectors.
         """
-        tmp_frequencies = tmp_frequencies.transpose()
-        tmp_polvecs = tmp_polvecs.transpose()
-        tmp_displacements = np.empty(tmp_polvecs.shape, dtype = np.complex128)
-        for mode in range(self.structure.Natoms * 3):
-            for atom in range(self.structure.Natoms):
-                i = 3 * atom
-                tmp_displacements[mode, i:i+3] = tmp_polvecs[mode, i:i+3] / np.sqrt(self.structure.masses[atom])
-        frequencies = np.empty(tmp_frequencies.shape, complex)
-        polvecs = np.empty(tmp_polvecs.shape, complex)
-        displacements = np.empty(tmp_polvecs.shape, complex)
-        order = np.argsort(tmp_frequencies)
-        for i, n in enumerate(order):
-            frequencies[i] = tmp_frequencies[n]
-            polvecs[i] = tmp_polvecs[n]
-            displacements[i] = tmp_displacements[n]
-        return frequencies, polvecs, displacements
-    
+        order = np.argsort(eigenvalues)
+        polvecs = eigenvectors.T[order]
+        displacements = polvecs / np.sqrt(_expanded_masses(self.structure.masses))
+        return eigenvalues[order], polvecs, displacements
+
     def copy(self) -> "DynQ":
-        """
-        This function makes a copy of the DynQ object.
-        """
+        """Return a deep copy of the object."""
         return copy.deepcopy(self)
-    
-    def write(self, file : str, alat : bool = True) -> None:
+
+    def write(self, file: str, alat: bool = True) -> None:
         """
-        This function writes the DynQ object in QuantumESPRESSO format.
-        
+        Write the q-star in QuantumESPRESSO dyn format.
+
         Parameters
         ----------
-            file: str.
-                Name of the file to be written.
-            alat: bool.
-                If we want to renormalize the dynamical matrix in alat units as ESPRESSO does. Usefull
-                is the dyn matrix will be used in a QunatumESPRESSO calcuation in the later.
+        file : str
+            Name of the output file.
+        alat : bool, optional
+            Write lengths in units of alat, as QuantumESPRESSO does. Needed if the file
+            is to be used in a later QuantumESPRESSO calculation. Defaults to True.
         """
-        file = open(file, "w")
-        file.write(f"Dynamical matrix file\n\n")
         fmt_general_info = "{0:>3d}{1:>5d}{2:>4d}{3:14.7f}{4:14.7f}{5:14.7f}{6:14.7f}{7:14.7f}{8:14.7f}\n"
         fmt_cell = "  {0:15.9f}{1:15.9f}{2:15.9f}\n"
         fmt_masses = " {0:>12d}  '{1:<4}'{2:20.9f}\n"
         fmt_atomic_position = "{0:>5d}{1:>5d} {2:16.10f} {3:16.10f} {4:16.10f}\n"
-        fmt_dyn_matrix="{0:12.8f} {1:12.8f}   {2:12.8f} {3:12.8f}   {4:12.8f} {5:12.8f}\n"
-        if alat:
-            norm = np.linalg.norm(self.structure.cell[0,:])
-        else:
-            norm = 1
-        file.write(fmt_general_info.format(
-            self.structure.Nspecies,
-            self.structure.Natoms, 
-            int(0),
-            norm*_consts.angstroms2bohr,
-            0,0,0,0,0)
-            )
-        file.write("Basis vectors\n")
-        for i in range(3):
-            file.write(fmt_cell.format(
-                self.structure.cell[i, 0]/norm,
-                self.structure.cell[i, 1]/norm,
-                self.structure.cell[i, 2]/norm,
-            ))
-        name_list = []
-        mass_list = []
-        for atom in range(self.structure.Natoms):
-            if self.structure.atom_species[atom, 0] not in name_list:
-                name_list.append(self.structure.atom_species[atom,0])
-                mass_list.append(self.structure.masses[atom])
-        for s in range(self.structure.Nspecies):
-            file.write(fmt_masses.format(
-                int(s+1),
-                name_list[s],
-                mass_list[s]
-            ))
-        for atom in range(self.structure.Natoms):
-            file.write(fmt_atomic_position.format(
-                int(atom+1),
-                int(self.structure.atom_species[atom, 1]),
-                self.structure.atom_coords[atom, 0]/norm,
-                self.structure.atom_coords[atom, 1]/norm,
-                self.structure.atom_coords[atom, 2]/norm
-            ))
-        for qi in range(self.Nqinstar):
-            file.write("\n     Dynamical  Matrix in cartesian axes\n\n")
-            file.write("     q = ( {0:14.9f}{1:14.9f}{2:14.9f} )\n\n".format(
-                self.qpoints_cart[qi, 0]*norm,
-                self.qpoints_cart[qi, 1]*norm,
-                self.qpoints_cart[qi, 2]*norm
-            ))
-            for i in range(self.structure.Natoms):
-                for j in range(self.structure.Natoms):
-                    file.write("{0:>5d}{1:>5d}\n".format(i+1, j+1))
-                    for k in range(3):
-                        file.write(fmt_dyn_matrix.format(
-                            self.phiqs[qi, i, j, k, 0].real,
-                            self.phiqs[qi, i, j, k, 0].imag,
-                            self.phiqs[qi, i, j, k, 1].real,
-                            self.phiqs[qi, i, j, k, 1].imag,
-                            self.phiqs[qi, i, j, k, 2].real,
-                            self.phiqs[qi, i, j, k, 2].imag,
+        fmt_dyn_matrix = "{0:12.8f} {1:12.8f}   {2:12.8f} {3:12.8f}   {4:12.8f} {5:12.8f}\n"
+        fmt_q = "     q = ( {0:14.9f}{1:14.9f}{2:14.9f} )\n\n"
+        fmt_freq = "     freq ({0:>4d}) = {1:14.6f} [THz] = {2:14.6f} [cm-1]\n"
+        fmt_mode = "({0:10.6f}{1:10.6f}{2:10.6f}{3:10.6f}{4:10.6f}{5:10.6f} )\n"
 
-                        ))
-        file.write("\n     Diagonalizing the dynamical matrix\n\n")
-        file.write("     q = ( {0:14.9f}{1:14.9f}{2:14.9f} )\n\n".format(
-                self.qpoints_cart[0, 0]*norm, 
-                self.qpoints_cart[0, 1]*norm,
-                self.qpoints_cart[0, 2]*norm
-            ))
-        file.write(" **************************************************************************\n")
-        for mode in range(self.structure.Natoms*3):
-            if np.square(self.frequencies[0, mode]) < 0: ## Maybe this is the problem.
-            #if np.abs(self.frequencies[0, mode].imag) > np.abs(self.frequencies[0, mode].real):
-                file.write("     freq ({0:>4d}) = {1:14.6f} [THz] = {2:14.6f} [cm-1]\n".format(
-                int(mode+1),
-                np.abs(self.frequencies[0, mode].imag) * _consts.cm2Thz*(-1),
-                np.abs(self.frequencies[0, mode].imag)*(-1)
-            ))
-            else:
-                file.write("     freq ({0:>4d}) = {1:14.6f} [THz] = {2:14.6f} [cm-1]\n".format(
-                    int(mode+1),
-                    self.frequencies[0, mode].real * _consts.cm2Thz,
-                    self.frequencies[0, mode].real
-                ))
-            for atom in range(self.structure.Natoms):
-                disp = self.displacements[0, mode, :]/np.linalg.norm(self.displacements[0, mode, :])
-                file.write("({0:10.6f}{1:10.6f}{2:10.6f}{3:10.6f}{4:10.6f}{5:10.6f} )\n".format(
-                    disp[atom*3].real,
-                    disp[atom*3].imag,
-                    disp[atom*3+1].real,
-                    disp[atom*3+1].imag,
-                    disp[atom*3+2].real,
-                    disp[atom*3+2].imag,
-                ))
-        file.write(" **************************************************************************\n")
+        structure = self.structure
+        nat = structure.Natoms
+        norm = np.linalg.norm(structure.cell[0, :]) if alat else 1
 
-    def _find_degs(self):
-        """
-        This function looks for vibrational modes with the same wave-vector modulation
-        and degenerate energies.
-        """
-        
-        nmodes = self.structure.Natoms * 3
-        self.degs = np.zeros([nmodes,nmodes], dtype=bool)
-        for mu in range(nmodes):
-            for nu in range(nmodes):
-                if np.abs(self.frequencies[0,mu]-self.frequencies[0,nu])<1e-3:
-                    self.degs[mu,nu]=True
+        # One (label, mass) per species, in order of first appearance.
+        species = {}
+        for atom in range(nat):
+            species.setdefault(structure.atom_species[atom, 0], structure.masses[atom])
 
-    def _expand_polvecs(self, modes : list, mod : list) -> tuple[list, list, np.ndarray]:
+        with open(file, "w") as f:
+            f.write("Dynamical matrix file\n\n")
+            f.write(fmt_general_info.format(structure.Nspecies, nat, 0, norm * _consts.angstroms2bohr, 0, 0, 0, 0, 0))
+            f.write("Basis vectors\n")
+            for vector in structure.cell:
+                f.write(fmt_cell.format(*(vector / norm)))
+            for s, (name, mass) in enumerate(species.items()):
+                f.write(fmt_masses.format(s + 1, name, mass))
+            for atom in range(nat):
+                f.write(fmt_atomic_position.format(atom + 1, int(structure.atom_species[atom, 1]), *(structure.atom_coords[atom] / norm)))
+
+            for qi in range(self.Nqinstar):
+                f.write("\n     Dynamical  Matrix in cartesian axes\n\n")
+                f.write(fmt_q.format(*(self.qpoints_cart[qi] * norm)))
+                for i in range(nat):
+                    for j in range(nat):
+                        f.write("{0:>5d}{1:>5d}\n".format(i + 1, j + 1))
+                        for row in self.phiqs[qi, i, j]:
+                            f.write(fmt_dyn_matrix.format(*np.column_stack([row.real, row.imag]).ravel()))
+
+            f.write("\n     Diagonalizing the dynamical matrix\n\n")
+            f.write(fmt_q.format(*(self.qpoints_cart[0] * norm)))
+            f.write(" **************************************************************************\n")
+            for mode in range(nat * 3):
+                frequency = self.frequencies[0, mode]
+                if np.square(frequency).real < 0:
+                    frequency_cm = -np.abs(frequency.imag)
+                else:
+                    frequency_cm = frequency.real
+                f.write(fmt_freq.format(mode + 1, frequency_cm * _consts.cm2Thz, frequency_cm))
+                disp = self.displacements[0, mode, :] / np.linalg.norm(self.displacements[0, mode, :])
+                for atom in range(nat):
+                    f.write(fmt_mode.format(*np.column_stack([disp[3 * atom : 3 * atom + 3].real, disp[3 * atom : 3 * atom + 3].imag]).ravel()))
+            f.write(" **************************************************************************\n")
+
+    def _find_degs(self, tol: float = 1e-3) -> None:
         """
-        Function to expand the polarization vectors out from the primitive cell.
+        Find degenerate modes of the first q-point of the star.
+
+        Sets ``self.degs[mu, nu]`` to True when the frequencies of ``mu`` and ``nu``
+        differ by less than ``tol`` (cm^-1).
+        """
+        frequencies = self.frequencies[0]
+        self.degs = np.abs(frequencies[:, None] - frequencies[None, :]) < tol
+
+    def _expand_polvecs(self, modes: list, mod: list) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Expand polarization vectors from the primitive cell to a supercell.
+
+        The vector of the cell at lattice position R = (i, j, k) is the primitive one
+        multiplied by exp(2*pi*i q.R); cells are ordered with k running fastest.
 
         Parameters
         ----------
-            modes: list or np.ndarray.
-                Which polarization vectors or vibrational modes will be expanded.
-                Example: [0,2,3], which means the modes 0, 2 and 3.
-            mod : list or np.ndarray.
-                Modulation of the expanded polvecs. A typical choice would be the q-grid.
+        modes : list of int
+            Modes to expand, e.g. ``[0, 2, 3]``.
+        mod : list of int, [3]
+            Supercell over which the modes are expanded, typically the q-grid.
+
         Returns
         -------
-            polvecs_list : list of np.array.
-                List of np.arrays containing the expanded polarization vectors for the specified 
-                modes in the q-star.
-            displacements_list : list of np.array.
-                List of np.arrays containing the displacemt vectors for the specified 
-                modes in the q-star.
-            exp_masses : np.array.
-                Masses for each atom in the supercell speciefied by mod. 
+        polvecs_list : np.ndarray of np.ndarray, [len(modes)]
+            For each mode, the normalized polarization vectors of every q-point of the
+            star, shape [Nqinstar, Nat_sc*3].
+        displacements_list : np.ndarray of np.ndarray, [len(modes)]
+            Same as ``polvecs_list`` divided by the square root of the atomic masses.
+        exp_masses : np.ndarray, [Nat_sc*3]
+            Mass associated with each component of the supercell vectors.
         """
-        exp_masses = np.empty([self.structure.Natoms * mod[0] * mod[1] * mod[2] * 3], complex)
+        exp_masses = _expanded_masses(self.structure.masses, mod)
+        lattice_points = np.array(list(np.ndindex(*mod)))
+        phases = np.exp(2j * np.pi * (self.qpoints @ lattice_points.T))  # [Nqinstar, Ncells]
+
         polvecs_list = np.empty(len(modes), dtype=object)
         displacements_list = np.empty(len(modes), dtype=object)
-        for mi,mode in enumerate(modes):
-            polvecs_instar = np.empty([self.Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
-            displacements_instar = np.empty([self.Nqinstar, self.structure.Natoms*mod[0]*mod[1]*mod[2]*3], dtype=complex)
-            for qi,q in enumerate(self.qpoints):
-                for i in range(mod[0]):
-                    for j in range(mod[1]):
-                        for k in range(mod[2]):
-                            polvecs_instar[
-                                qi,
-                                self.structure.Natoms
-                                * 3
-                                * (mod[1] * mod[2] * i + mod[2] * j + k) : self.structure.Natoms
-                                * 3
-                                * (mod[1] * mod[2] * i + mod[2] * j + k + 1)
-                            ] = self.polvecs[qi, mode] * np.exp(
-                                2j
-                                * np.pi
-                                * np.matmul(q,
-                                    np.array([i, j, k]),
-                                )
-                            )
-                            for atom in range(self.structure.Natoms):
-                                exp_masses[
-                                    self.structure.Natoms
-                                    * 3
-                                    * (mod[1] * mod[2] * i + mod[2] * j + k)
-                                    + atom
-                                    * 3 : self.structure.Natoms
-                                    * 3
-                                    * (mod[1] * mod[2] * i + mod[2] * j + k)
-                                    + (atom + 1) * 3
-                                ] = self.structure.masses[atom]
-                polvecs_instar[qi] = polvecs_instar[qi] / np.linalg.norm(polvecs_instar[qi])
-                ##############################################################################
-                ##### The displacements are constructed from already normalized pol vecs #####
-                ##############################################################################
-                for i in range(self.structure.Natoms * mod[0] * mod[1] * mod[2] * 3):
-                    displacements_instar[qi,i] = polvecs_instar[qi,i] / np.sqrt(exp_masses[i])
-            polvecs_list[mi] = polvecs_instar
-            displacements_list[mi] = displacements_instar
+        for mi, mode in enumerate(modes):
+            polvecs = np.reshape(phases[:, :, None] * self.polvecs[:, mode, None, :], [self.Nqinstar, -1])
+            polvecs = polvecs / np.linalg.norm(polvecs, axis=1, keepdims=True)
+            polvecs_list[mi] = polvecs
+            displacements_list[mi] = polvecs / np.sqrt(exp_masses)
         return polvecs_list, displacements_list, exp_masses
 
-    def compute_traces(self):
-        self.traces = np.empty([self.structure.Natoms*3,len(self.lg_idx)], dtype=np.complex128)
-        for mu in range(self.structure.Natoms*3):
-            for nu in range(self.structure.Natoms*3):
-                if self.degs[mu,nu] and mu >= nu:
-                    for li in range(len(self.lg_idx)):
-                        if np.sum(self.degs[mu] == 1):
-                            self.traces[mu,li] = self.Pmn[mu,mu,li]
-                        else:
-                            self.traces[mu,li] = np.trace(self.Pmn[self.degs[mu],self.degs[mu],li])
-                            self.traces[nu,li] = self.traces[mu,li] 
+    def compute_traces(self) -> None:
+        """
+        Compute the characters of the little-group representations.
+
+        Requires ``self.Pmn`` (see :meth:`DynMatrix.get_Pmn`). Sets ``self.traces``,
+        shape [Natoms*3, len(lg_idx)], where each mode gets the trace of ``Pmn`` over
+        its block of degenerate modes.
+        """
+        diagonal = np.einsum("kkl->kl", self.Pmn)
+        self.traces = self.degs.astype(np.complex128) @ diagonal
+
+
+def _expanded_masses(masses: np.ndarray, mod: list = (1, 1, 1)) -> np.ndarray:
+    """Masses repeated for each cartesian component and each cell of the ``mod`` supercell."""
+    return np.tile(np.repeat(masses, 3), int(np.prod(mod)))
+
+
+def _eigenvalues_to_cm(eigenvalues: np.ndarray) -> np.ndarray:
+    """Convert eigenvalues of the dynamical matrix (Ry units) to complex frequencies in cm^-1."""
+    return np.sqrt(np.asarray(eigenvalues, dtype=np.complex128)) * _consts.Ry2cm
+
+
+def _signed_frequencies(frequencies: np.ndarray) -> np.ndarray:
+    """
+    Real frequencies for plotting, with the leading imaginary ones shown as negative.
+
+    ``frequencies`` must be sorted by eigenvalue, so imaginary modes come first.
+    """
+    imaginary = np.cumprod(np.square(frequencies).real < 0).astype(bool)
+    return np.where(imaginary, -np.sqrt(np.abs(np.square(frequencies))), frequencies.real)
