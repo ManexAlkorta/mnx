@@ -22,6 +22,7 @@ See ``Tutorial/DynMatrix.ipynb`` for a guided tour.
 from __future__ import annotations
 
 import copy
+import os
 import tempfile
 
 import numpy as np
@@ -119,7 +120,8 @@ class DynMatrix:
         Read the force constants of a VASP + phonopy calculation.
 
         The structure is read from ``primPOSCAR`` (falling back to ``POSCAR``) and the
-        force constants from ``phonopy_disp.yaml`` inside ``folder``.
+        force constants from ``phonopy_disp.yaml`` (falling back to ``phonopy.yaml``) inside
+        ``folder``.
 
         Parameters
         ----------
@@ -143,10 +145,12 @@ class DynMatrix:
         instance._alat = np.linalg.norm(instance.structure.cell[0, :])
         instance.super_structure = instance.structure.expand_structure(instance.qgrid)
 
+        # phonopy looks for FORCE_SETS in the working directory unless told otherwise.
+        force_sets = f"{folder}/FORCE_SETS" if os.path.isfile(f"{folder}/FORCE_SETS") else None
         try:
-            phonon = phonopy.load(f"{folder}/phonopy_disp.yaml")
-        except:
-            phonon = phonopy.load(f"{folder}/phonopy.yaml")
+            phonon = phonopy.load(f"{folder}/phonopy_disp.yaml", force_sets_filename=force_sets)
+        except FileNotFoundError:
+            phonon = phonopy.load(f"{folder}/phonopy.yaml", force_sets_filename=force_sets)
         masses = phonon.masses / _consts.Ry2AMU
         instance.structure.masses = masses
         nat = instance.structure.Natoms
