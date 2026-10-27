@@ -69,11 +69,16 @@ The phonon core, and the first module polished.
 ---
 
 ## Stage 1 — Safety net: tests and CI
-- ⬜ Add `tests/` with `pytest`, using the small dyn files already in `Tutorial/dyns`
-  as fixtures (CrSb 2×2×2, CsV3Sb5 Γ-only). Reference values: frequencies at the
-  grid q-points, a short band path, a symmetrised `phiR`.
-- ⬜ GitHub Actions workflow: build with `meson-python` (gfortran + OpenBLAS) and run
-  the tests on Python 3.10–3.12.
+- ✅ `tests/test_interpolation.py`: Fourier interpolation checked against
+  QuantumESPRESSO `matdyn.x` (RbH12 3×3×3, 901 q-points, agreement < 0.01 cm⁻¹),
+  grid q-points reproduce the input dyn files in both gauges, `get_dynq` and
+  `get_bands` agree, and band paths are sampled correctly for any `N`.
+- ✅ GitHub Actions workflow (`.github/workflows/tests.yml`): builds mnx with
+  `meson-python` (gfortran + OpenBLAS) and runs the tests on every pull request.
+- ⬜ Protect `main` so the `tests` check must pass before merging
+  (Settings → Rules / Branches on GitHub).
+- ⬜ More tests: `Symmetrize`, `distort_structure`, `write`/`from_file` round trip,
+  `from_phonopy`; extend CI to Python 3.11–3.12.
 - ⬜ Add `ruff` (lint + format) with a `pyproject.toml` config and a pre-commit hook.
 
 ## Stage 2 — `Structure` (`src/mnx/structure.py`)

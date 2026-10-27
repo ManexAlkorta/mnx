@@ -1,0 +1,5 @@
+&INPUT
+	fildyn="hessian",
+	flfrc="dyn.fc",
+	zasr="simple",
+/

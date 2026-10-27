@@ -28,3 +28,6 @@ dependencies = [
     "trame-pyvista",
     "nest_asyncio2",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
