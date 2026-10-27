@@ -2,6 +2,11 @@
 
 ***mnx*** is a code to handle crystallographic structures and dynamical matrixes. At the moment it is implemented to work with ***QuantumESPRESSO*** and ***VASP-PHONOPY*** formats, also supporting the ***SSCHA*** code.
 
+## Documentation
+
+- [Phonons with `DynMatrix`](docs/dyn_matrix.md): features, units, conventions, equations and plotting with `mnx.io`.
+- Tutorials: notebooks in [`Tutorial/`](Tutorial).
+
 ## Installation
 
 It is recommended to prepare a clean python environment to install ***mnx***.
