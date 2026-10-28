@@ -79,6 +79,7 @@ names below.
 | `get_bands_with_SF(k_inpath, N, Q)` | dispersion and one-phonon structure factor at `Q + k` |
 | `expand_polvecs(modes, mod)` | polarization vectors and displacements on a supercell |
 | `distort_structure(Q, modes, mod)` | supercell displaced along a combination of modes |
+| `project_structure(structure, modes, cutoff)` | amplitudes Q of the selected modes in a structure (inverse of `distort_structure`) |
 | `Symmetrize(symprec)` | symmetrizes structure and force constants |
 | `get_Pmn(symprec)` | little-group representation matrices of every star |
 | `write(prefix)` / `to_CC()` | QE dyn files / CellConstructor `Phonons` |
@@ -139,8 +140,17 @@ $$
 u_{\nu, a}^{\alpha} = \frac{e_{\nu, a}^{\alpha}}{\sqrt{m_a}} .
 $$
 
-`DynQ.from_file` diagonalizes with `numpy.linalg.eig`. Interpolated spectra (`get_dynq`,
-`get_bands`) come from LAPACK `zheev` in the Fortran routine `FModules.interpolation.diag_dynq`.
+D(**q**) is Hermitian, so the modes stored in each `DynQ` (from `from_file`, `from_phonopy`
+and `Symmetrize`) are computed with `numpy.linalg.eigh` and are **orthonormal**,
+⟨e_μ\|e_ν⟩ = δ_μν, also inside degenerate subspaces. Two gauge choices fix their phases:
+
+- at **self-conjugate** q-points (2**q** = **G**, e.g. Γ, M, L), D(**q**) is real in the lattice gauge
+  and the eigenvectors are chosen **real**;
+- when −**q** (mod **G**) belongs to the same star, its eigenvectors are the **complex conjugates**
+  of those at **q**, as allowed by D(−**q**) = D(**q**)*.
+
+Interpolated spectra (`get_dynq`, `get_bands`) come from LAPACK `zheev` in the Fortran routine
+`FModules.interpolation.diag_dynq`. Those are orthonormal too, but their phases are not fixed.
 
 ### Reading the input
 
@@ -215,7 +225,45 @@ $$
 $$
 
 with one amplitude Q_{s,i} per q-point of each selected star. Since u has units of
-1/√m, Q is in Å·√(Ry mass), so typical amplitudes are tens to hundreds.
+1/√m, Q is in Å·√(Ry mass), so typical amplitudes are tens to hundreds. Every q-point of
+the selected stars must be commensurate with `mod` (q·mod integer); otherwise a
+`ValueError` is raised. Commensurate q-points are snapped to the exact grid values, so
+round-off in the input files (e.g. −0.49999999) doesn't add spurious phases.
+
+### Projecting a structure onto modes (`project_structure`)
+
+`project_structure(structure, modes, cutoff=0.2)` is the inverse of `distort_structure`:
+
+```python
+distorted = dyn.distort_structure(Q=[[10, 0, 0], [0, 10, 10]], modes=[[2, 0], [3, 0]])
+dyn.project_structure(distorted, modes=[[2, 0], [3, 0]])
+# [array([10, 0, 0]), array([0, 10, 10])]   (complex dtype)
+```
+
+1. **Supercell**: `mod` is read from `structure.cell @ inv(primitive cell)`, which must be a
+   diagonal integer matrix (to 10⁻⁴). Strained cells are rejected.
+2. **Matching**: every site A of the undistorted supercell (`expand_structure(mod)`) gets the
+   atom of the same species at the shortest periodic distance (minimum image). The pairing
+   must be one-to-one with all distances below `cutoff` (Å). Otherwise a `ValueError` names
+   the failing site or atom. The atom order of `structure` is irrelevant.
+3. **Fit**: with Δ**r**_A the minimum-image displacement of the matched atom, the amplitudes
+   of the selected modes solve, by least squares,
+
+$$
+\sqrt{m_A}\,\Delta\mathbf r_A = \sum_{s}\sum_{i \in \text{star } s} \mathrm{Re}\left[Q_{s,i}\, \mathbf e^{\text{sc}}_{s,i}(A)\right],
+$$
+
+   i.e. two real unknowns, Re Q and Im Q, per q-point and selected mode.
+
+Because the modes are orthonormal, components along modes that aren't selected don't leak
+into the result, and a distortion is recovered exactly (to ~10⁻¹³ on the tests). Two
+consequences of the gauge choices above:
+
+- At **self-conjugate q** the modes are real, so only Re Q moves the atoms and Q comes back
+  real.
+- When **q and −q are in the same star**, a distortion only fixes Q_q + Q₋q*.
+  `project_structure` returns the even split, Q₋q = Q_q*. For example `[4, 0]` comes back as
+  `[2, 2]`, which gives exactly the same structure.
 
 ### Structure factor (`get_bands_with_SF`)
 
@@ -302,6 +350,7 @@ The tests in [`tests/`](../tests) run on every pull request (`.github/workflows/
 | `test_phonopy.py::test_interpolation_matches_phonopy` | phonopy, on and off the 2×2×2 grid | < 0.01 cm⁻¹ (max 1e-4) |
 | `test_interpolation.py::test_grid_points_reproduce_dyn_files` | input dyn files, both gauges | < 1e-3 cm⁻¹ |
 | `test_io.py` | `mnx.io` with real and synthetic bands | exact |
+| `test_projection.py` | `distort_structure` → shuffle atoms → `project_structure` returns the input Q; modes orthonormal; integer characters; errors | < 1e-9 |
 
 Run them locally from the repository root with `python -m pytest -v`.
 
@@ -312,9 +361,8 @@ Run them locally from the repository root with `python -m pytest -v`.
   the relative accuracy to ~10⁻⁷, which is still well below the QE comparison tolerance.
 - **No non-analytic correction**: there is no LO–TO splitting term for polar materials, and
   no acoustic sum rule is imposed on Φ.
-- **`get_Pmn` index check**: the supercell symmetries from CellConstructor are indexed with
-  `lg_idx`, which comes from the primitive-cell spglib list. Some characters come out
-  non-integer on CrSb, so check that both lists are ordered the same way.
+- **`project_structure` memory**: atom matching builds an Nₐₜ × Nₐₜ distance table, which is
+  fine up to a few thousand atoms in the supercell.
 - **`_alat` units**: Å after `from_file` / `from_phonopy`, bohr after `change_cell`.
   Nothing reads it today.
 - **phonopy deprecations**: phonopy ≥ 3.x warns that `get_dynamical_matrix_at_q` is
