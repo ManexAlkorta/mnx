@@ -85,11 +85,35 @@ def test_unselected_modes_do_not_leak(crsb):
         np.testing.assert_allclose(amplitudes, 0, atol=1e-9)
 
 
-def test_time_reversal_pairs(rbh12):
-    """For q and -q in one star only Q_q + conj(Q_-q) is fixed; it is split evenly."""
-    for Q, expected in [([2, 2], [2, 2]), ([2 + 1j, 2 - 1j], [2 + 1j, 2 - 1j]), ([4, 0], [2, 2])]:
-        distorted = rbh12.distort_structure(Q=[Q], modes=[[2, 10]])
-        np.testing.assert_allclose(rbh12.project_structure(distorted, modes=[[2, 10]])[0], expected, atol=1e-9)
+@pytest.mark.parametrize("Q", [[2, 2], [2 + 1j, 2 - 1j], [-3j, 3j]])
+def test_time_reversal_pairs_round_trip(rbh12, Q):
+    """With q and -q in one star, any real distortion (Q_-q = conj(Q_q)) comes back unchanged."""
+    distorted = rbh12.distort_structure(Q=[Q], modes=[[2, 10]])
+    np.testing.assert_allclose(rbh12.project_structure(_shuffled(distorted), modes=[[2, 10]])[0], Q, atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "name, Q, modes",
+    [
+        ("rbh12", [[4, 0]], [[2, 10]]),  # q without its -q partner
+        ("rbh12", [[2, 2 + 1j]], [[2, 10]]),  # Q_-q != conj(Q_q)
+        ("crsb", [[10j, 0, 0]], [[2, 0]]),  # complex amplitude on a real (zone-boundary) mode
+    ],
+)
+def test_imaginary_distortion_raises(name, Q, modes, request):
+    with pytest.raises(ValueError, match="imaginary displacement"):
+        request.getfixturevalue(name).distort_structure(Q=Q, modes=modes)
+
+
+def test_projection_is_independent_per_mode(rbh12):
+    """Each amplitude depends only on its own mode, not on which other modes are selected."""
+    reference = rbh12.structure.expand_structure([3, 3, 3])
+    noise = 0.01 * np.random.default_rng(1).standard_normal(reference.atom_coords.shape)
+    noisy = mnx.Structure.from_data(reference.cell, reference.atom_coords + noise, reference.atom_species)
+    alone = rbh12.project_structure(noisy, modes=[[2, 10]])[0]
+    together = rbh12.project_structure(noisy, modes=[[3, 1], [2, 10], [0, 5]])[1]
+    np.testing.assert_allclose(alone, together, atol=1e-14)
+    np.testing.assert_allclose(alone[1], alone[0].conj(), atol=1e-12)  # real displacement
 
 
 def test_atom_beyond_cutoff_raises(crsb):

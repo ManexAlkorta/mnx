@@ -181,8 +181,16 @@ class DynMatrix:
         return instance
 
     def distort_structure(self, Q: list, modes: list, mod: list | None = None) -> Structure:
-        """
+        r"""
         Displace the atoms along a combination of phonon modes.
+
+        .. math:: \mathbf r_A = \mathbf r_A^0 + \sum_{s,i} Q_{s,i}\, \mathbf u^{sc}_{s,i}(A)
+
+        where :math:`\mathbf u^{sc} = \mathbf e^{sc}/\sqrt{m}` are the supercell modes of
+        :meth:`expand_polvecs`. The sum has to be real: modes at self-conjugate q-points
+        (Gamma, M, L, ...) are real and need real amplitudes, and when q and -q are in a
+        star (their modes are complex conjugates) the amplitudes must satisfy
+        ``Q_-q = conj(Q_q)``. :meth:`project_structure` recovers ``Q`` from the result.
 
         Parameters
         ----------
@@ -201,19 +209,30 @@ class DynMatrix:
         Returns
         -------
         Structure
-            The distorted supercell. :meth:`project_structure` recovers ``Q`` from it.
+            The distorted supercell.
+
+        Raises
+        ------
+        ValueError
+            If a q-point is not commensurate with ``mod``, or the amplitudes give an
+            imaginary displacement.
         """
         if mod is None:
             mod = self.qgrid
         self._check_commensurate(modes, mod)
 
         supercell = self.structure.expand_structure(mod)
-        atom_coords = supercell.atom_coords.copy()
         _, displacements, _ = self.expand_polvecs(modes=modes, mod=mod)
+        displacement = np.zeros(supercell.atom_coords.shape, dtype=np.complex128)
         for qs, displacements_instar in enumerate(displacements):
-            for i, displacement in enumerate(displacements_instar):
-                atom_coords += np.real(Q[qs][i] * np.reshape(displacement, atom_coords.shape))
-        return Structure.from_data(supercell.cell, atom_coords, supercell.atom_species)
+            for i, mode_displacement in enumerate(displacements_instar):
+                displacement += Q[qs][i] * np.reshape(mode_displacement, displacement.shape)
+        if np.abs(displacement.imag).max() > 1e-8 * max(np.abs(displacement).max(), 1e-12):
+            raise ValueError(
+                "The amplitudes give an imaginary displacement. Use real Q for modes at "
+                "self-conjugate q-points, and Q_-q = conj(Q_q) when q and -q are both distorted."
+            )
+        return Structure.from_data(supercell.cell, supercell.atom_coords + displacement.real, supercell.atom_species)
 
     def project_structure(self, structure: Structure, modes: list, cutoff: float = 0.2) -> list:
         r"""
@@ -225,16 +244,14 @@ class DynMatrix:
         Atoms are matched to the sites of the undistorted supercell by species and
         periodic distance, so their order in ``structure`` does not matter.
 
-        The amplitudes solve, in the least-squares sense,
+        Each amplitude is the independent projection onto its mode,
 
-        .. math:: \sqrt{m_A}\, \Delta\mathbf r_A = \sum_{s,i} \mathrm{Re}\left[Q_{s,i}\, \mathbf e^{sc}_{s,i}(A)\right]
+        .. math:: Q_{s,i} = \sum_A \sqrt{m_A}\; \mathbf e^{sc}_{s,i}(A)^{*} \cdot \Delta\mathbf r_A ,
 
-        over the selected modes, with the same normalized supercell vectors used by
-        :meth:`distort_structure`. Modes are orthonormal, so components along modes that
-        are not selected do not leak into the result. At self-conjugate q-points (Gamma
-        and zone-boundary points such as M or L) the modes are real and only Re(Q) has an
-        effect, so Q comes back real. When q and -q are both in a star, a distortion only
-        fixes Q_q + conj(Q_-q); the result splits it evenly, Q_-q = conj(Q_q).
+        with the same normalized supercell modes used by :meth:`distort_structure`.
+        Modes are orthonormal, so the result is unique and does not depend on which other
+        modes are selected. For a real displacement, modes at self-conjugate q-points
+        give real amplitudes and q, -q pairs give ``Q_-q = conj(Q_q)``.
 
         Parameters
         ----------
@@ -270,12 +287,8 @@ class DynMatrix:
         _, displacements = _cell.match_atoms(structure, reference, cutoff)
 
         polvecs, _, exp_masses = self.expand_polvecs(modes, mod)
-        target = np.sqrt(exp_masses) * displacements.ravel()
-        # Re[Q e] = Re(Q) Re(e) - Im(Q) Im(e): two real columns per q-point and mode.
-        columns = [part for polvecs_instar in polvecs for e in polvecs_instar for part in (e.real, -e.imag)]
-        coefficients = np.linalg.lstsq(np.column_stack(columns), target, rcond=1e-10)[0]
-        Q = coefficients[0::2] + 1j * coefficients[1::2]
-        return np.split(Q, np.cumsum([len(polvecs_instar) for polvecs_instar in polvecs])[:-1])
+        weighted = np.sqrt(exp_masses) * displacements.ravel()
+        return [polvecs_instar.conj() @ weighted for polvecs_instar in polvecs]
 
     def info(self) -> None:
         """Print a summary of the structure and of the q-stars."""

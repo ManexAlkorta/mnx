@@ -221,13 +221,20 @@ where 𝒩 normalizes e^sc over the whole supercell. `distort_structure(Q, modes
 displaces the supercell along
 
 $$
-\mathbf r_A = \mathbf r_A^{0} + \sum_{s}\sum_{i \in \text{star } s} \mathrm{Re}\left[Q_{s,i}\, \mathbf u^{\text{sc}}_{s,i}(A)\right],
+\mathbf r_A = \mathbf r_A^{0} + \sum_{s}\sum_{i \in \text{star } s} Q_{s,i}\, \mathbf u^{\text{sc}}_{s,i}(A),
 $$
 
 with one amplitude Q_{s,i} per q-point of each selected star. Since u has units of
-1/√m, Q is in Å·√(Ry mass), so typical amplitudes are tens to hundreds. Every q-point of
-the selected stars must be commensurate with `mod` (q·mod integer); otherwise a
-`ValueError` is raised. Commensurate q-points are snapped to the exact grid values, so
+1/√m, Q is in Å·√(Ry mass), so typical amplitudes are tens to hundreds.
+
+The displacement must be **real**, otherwise a `ValueError` is raised:
+
+- at self-conjugate q (Γ, M, L, …) the modes are real, so Q must be real;
+- when q and −q are both distorted, their modes are complex conjugates, so Q₋q = Q_q*
+  (e.g. `[2, 2]` or `[2+1j, 2-1j]`; `[4, 0]` is rejected).
+
+Every q-point of the selected stars must be commensurate with `mod` (q·mod integer);
+otherwise a `ValueError` is raised. Commensurate q-points are snapped to the exact grid values, so
 round-off in the input files (e.g. −0.49999999) doesn't add spurious phases.
 
 ### Projecting a structure onto modes (`project_structure`)
@@ -246,24 +253,17 @@ dyn.project_structure(distorted, modes=[[2, 0], [3, 0]])
    atom of the same species at the shortest periodic distance (minimum image). The pairing
    must be one-to-one with all distances below `cutoff` (Å). Otherwise a `ValueError` names
    the failing site or atom. The atom order of `structure` is irrelevant.
-3. **Fit**: with Δ**r**_A the minimum-image displacement of the matched atom, the amplitudes
-   of the selected modes solve, by least squares,
+3. **Projection**: with Δ**r**_A the minimum-image displacement of the matched atom, each
+   amplitude is the independent projection onto its own mode,
 
 $$
-\sqrt{m_A}\,\Delta\mathbf r_A = \sum_{s}\sum_{i \in \text{star } s} \mathrm{Re}\left[Q_{s,i}\, \mathbf e^{\text{sc}}_{s,i}(A)\right],
+Q_{s,i} = \sum_A \sqrt{m_A}\; \mathbf e^{\text{sc}}_{s,i}(A)^{*} \cdot \Delta\mathbf r_A .
 $$
 
-   i.e. two real unknowns, Re Q and Im Q, per q-point and selected mode.
-
-Because the modes are orthonormal, components along modes that aren't selected don't leak
-into the result, and a distortion is recovered exactly (to ~10⁻¹³ on the tests). Two
-consequences of the gauge choices above:
-
-- At **self-conjugate q** the modes are real, so only Re Q moves the atoms and Q comes back
-  real.
-- When **q and −q are in the same star**, a distortion only fixes Q_q + Q₋q*.
-  `project_structure` returns the even split, Q₋q = Q_q*. For example `[4, 0]` comes back as
-  `[2, 2]`, which gives exactly the same structure.
+Because the modes are orthonormal, the result is **unique**: an amplitude doesn't depend on
+which other modes are selected, and a distortion is recovered exactly (to ~10⁻¹³ on the
+tests). For any real displacement, modes at self-conjugate q give real amplitudes, and q, −q
+pairs give Q₋q = Q_q*.
 
 ### Structure factor (`get_bands_with_SF`)
 
