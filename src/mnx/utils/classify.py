@@ -61,11 +61,10 @@ def GetIRT(structure, symmetry):
     for atom in range(structure.Natoms):
         new_coords_frac = symmetry[:,:3] @ _cell.cart2cryst(structure.atom_coords[atom,:], structure.cell)+symmetry[:,3]
         new_coords = _cell.cryst2cart(_to_unit_cell(new_coords_frac), structure.cell)
-        i = np.where(np.isclose(new_coords,structure.atom_coords, atol=1e-3).all(axis=1))
-        try:
-            irt[atom] = i[0]
-        except:
-            breakpoint()
+        matches = np.flatnonzero(np.isclose(new_coords,structure.atom_coords, atol=1e-3).all(axis=1))
+        if len(matches) != 1:
+            raise ValueError(f"Symmetry operation maps atom {atom} onto {len(matches)} atoms instead of one")
+        irt[atom] = matches[0]
     return irt
 
 def _to_unit_cell(coords_frac):
