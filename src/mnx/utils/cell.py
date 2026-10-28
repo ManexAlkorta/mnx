@@ -378,6 +378,45 @@ def corrected_displacements(struct, ref_struct):
     du = np.reshape(du, [struct.Natoms, 3])
     return du
 
+def match_atoms(structure, reference, cutoff):
+    """Match the atoms of a structure to the sites of a reference with the same cell.
+
+    Each reference site is paired with the atom of the same species at the shortest
+    periodic (minimum image) distance. The matching must be one to one and every
+    distance below ``cutoff``; otherwise a ValueError explains which atom failed.
+
+    Input:
+        structure: Structure object, atoms in any order.
+        reference: Structure object with the sites, same cell and number of atoms.
+        cutoff: Largest allowed distance between an atom and its site, in Angstrom.
+
+    Returns:
+        order: For each reference site, index of the matched atom of structure. np.array. [Natoms].
+        displacements: Atom position minus site position, minimum image, in Angstrom. np.array. [Natoms, 3].
+    """
+    if structure.Natoms != reference.Natoms:
+        raise ValueError(f"The structure has {structure.Natoms} atoms but the reference supercell has {reference.Natoms}")
+
+    diff = cart2cryst(structure.atom_coords, reference.cell)[None, :, :] - cart2cryst(reference.atom_coords, reference.cell)[:, None, :]
+    diff -= np.round(diff)
+    vectors = diff @ reference.cell  # [site, atom, 3]
+    distances = np.linalg.norm(vectors, axis=-1)
+    distances[reference.atom_species[:, 0][:, None] != structure.atom_species[:, 0][None, :]] = np.inf
+
+    sites = np.arange(reference.Natoms)
+    order = distances.argmin(axis=1)
+    nearest = distances[sites, order]
+    for site in np.flatnonzero(nearest > cutoff):
+        species = reference.atom_species[site, 0]
+        found = "no atom of that species" if np.isinf(nearest[site]) else f"the closest {species} is {nearest[site]:.3f} A away"
+        raise ValueError(f"No atom within {cutoff} A of site {site} ({species} at {np.round(reference.atom_coords[site], 4)}): {found}")
+    atoms, counts = np.unique(order, return_counts=True)
+    if np.any(counts > 1):
+        atom = atoms[counts > 1][0]
+        raise ValueError(f"Atom {atom} of the structure is the closest match of sites {list(np.flatnonzero(order == atom))}; reduce the cutoff or check the structure")
+    return order, vectors[sites, order]
+
+
 def get_reccellpos(rot_cell, ref_cell, symprec):
     rel_cell_pos = np.zeros([3, 3])
     for i, pos in enumerate(rot_cell):

@@ -177,6 +177,7 @@ class DynMatrix:
         for qi, q in enumerate(qpoints):
             instance.qstars[qi] = np.asarray([q])
             instance.DynQs[qi] = instance.get_dynq(q, gauge="lattice")
+            instance.DynQs[qi]._diagonalize()  # same gauge-fixed, orthonormal modes as from_file
         return instance
 
     def distort_structure(self, Q: list, modes: list, mod: list | None = None) -> Structure:
@@ -194,15 +195,17 @@ class DynMatrix:
             order as ``Q``. For the first mode of star 0 and the second mode of star 1:
             ``modes = [[0, 0], [1, 1]]``.
         mod : list of int, [3], optional
-            Supercell of the distorted structure. Defaults to ``qgrid``.
+            Supercell of the distorted structure. Defaults to ``qgrid``. Every q-point
+            of the selected stars must be commensurate with it.
 
         Returns
         -------
         Structure
-            The distorted supercell.
+            The distorted supercell. :meth:`project_structure` recovers ``Q`` from it.
         """
         if mod is None:
             mod = self.qgrid
+        self._check_commensurate(modes, mod)
 
         supercell = self.structure.expand_structure(mod)
         atom_coords = supercell.atom_coords.copy()
@@ -211,6 +214,68 @@ class DynMatrix:
             for i, displacement in enumerate(displacements_instar):
                 atom_coords += np.real(Q[qs][i] * np.reshape(displacement, atom_coords.shape))
         return Structure.from_data(supercell.cell, atom_coords, supercell.atom_species)
+
+    def project_structure(self, structure: Structure, modes: list, cutoff: float = 0.2) -> list:
+        r"""
+        Decompose the displacements of a structure into phonon modes.
+
+        This is the inverse of :meth:`distort_structure`: for ``s = distort_structure(Q,
+        modes)``, ``project_structure(s, modes)`` returns ``Q``. The supercell is taken
+        from ``structure.cell``, which must be a diagonal multiple of the primitive cell.
+        Atoms are matched to the sites of the undistorted supercell by species and
+        periodic distance, so their order in ``structure`` does not matter.
+
+        The amplitudes solve, in the least-squares sense,
+
+        .. math:: \sqrt{m_A}\, \Delta\mathbf r_A = \sum_{s,i} \mathrm{Re}\left[Q_{s,i}\, \mathbf e^{sc}_{s,i}(A)\right]
+
+        over the selected modes, with the same normalized supercell vectors used by
+        :meth:`distort_structure`. Modes are orthonormal, so components along modes that
+        are not selected do not leak into the result. At self-conjugate q-points (Gamma
+        and zone-boundary points such as M or L) the modes are real and only Re(Q) has an
+        effect, so Q comes back real. When q and -q are both in a star, a distortion only
+        fixes Q_q + conj(Q_-q); the result splits it evenly, Q_-q = conj(Q_q).
+
+        Parameters
+        ----------
+        structure : Structure
+            Distorted supercell, in any atom order.
+        modes : list of [int, int]
+            ``[star, mode]`` pairs to project onto, as in :meth:`distort_structure`.
+        cutoff : float, optional
+            Largest displacement in Angstrom allowed when matching each atom to its site
+            in the undistorted supercell. Defaults to 0.2.
+
+        Returns
+        -------
+        list of np.ndarray
+            For each entry of ``modes``, the complex amplitudes of every q-point of its
+            star, in the units of ``Q`` in :meth:`distort_structure`.
+
+        Raises
+        ------
+        ValueError
+            If the cell is not a diagonal supercell, a q-point is not commensurate with
+            it, or the atoms cannot be matched within ``cutoff``.
+
+        Examples
+        --------
+        >>> distorted = dyn.distort_structure(Q=[[10, 0, 0], [0, 10, 10]], modes=[[2, 0], [3, 0]])
+        >>> dyn.project_structure(distorted, modes=[[2, 0], [3, 0]])
+        [array([10.+0.j, 0.+0.j, 0.+0.j]), array([0.+0.j, 10.+0.j, 10.+0.j])]
+        """
+        mod = self._supercell_of(structure)
+        self._check_commensurate(modes, mod)
+        reference = self.structure.expand_structure(mod)
+        _, displacements = _cell.match_atoms(structure, reference, cutoff)
+
+        polvecs, _, exp_masses = self.expand_polvecs(modes, mod)
+        target = np.sqrt(exp_masses) * displacements.ravel()
+        # Re[Q e] = Re(Q) Re(e) - Im(Q) Im(e): two real columns per q-point and mode.
+        columns = [part for polvecs_instar in polvecs for e in polvecs_instar for part in (e.real, -e.imag)]
+        coefficients = np.linalg.lstsq(np.column_stack(columns), target, rcond=1e-10)[0]
+        Q = coefficients[0::2] + 1j * coefficients[1::2]
+        return np.split(Q, np.cumsum([len(polvecs_instar) for polvecs_instar in polvecs])[:-1])
 
     def info(self) -> None:
         """Print a summary of the structure and of the q-stars."""
@@ -398,12 +463,9 @@ class DynMatrix:
         for si, star in enumerate(self.qstars):
             dynq = self.DynQs[si]
             for qi, q in enumerate(star):
-                phiq, eigenvalues, polvecs = self._interpolate(q, "lattice")
-                dynq.phiqs[qi] = phiq
-                dynq.dynqs[qi] = phiq / np.sqrt(np.outer(self.structure.masses, self.structure.masses))[:, :, None, None]
-                dynq.frequencies[qi] = _eigenvalues_to_cm(eigenvalues)
-                dynq.polvecs[qi] = polvecs
-                dynq.displacements[qi] = polvecs / np.sqrt(_expanded_masses(self.structure.masses))
+                dynq.phiqs[qi] = self._interpolate(q, "lattice")[0]
+            dynq.dynqs = dynq._phis2dyns()
+            dynq._diagonalize()
 
     def SetupFromSPGLIB(self, symprec: float) -> None:
         """
@@ -536,6 +598,24 @@ class DynMatrix:
                 P = np.conjugate(polvecs) @ np.reshape(rotated, [nmodes, -1]).T
                 dynq.Pmn[:, :, li] = np.where(dynq.degs, P, 0)
 
+    def _supercell_of(self, structure: Structure) -> list:
+        """Diagonal supercell ``mod`` such that ``structure.cell`` = mod x primitive cell."""
+        M = structure.cell @ np.linalg.inv(self.structure.cell)
+        mod = np.round(np.diag(M)).astype(int)
+        if np.any(mod < 1) or not np.allclose(M, np.diag(mod), atol=1e-4):
+            raise ValueError(
+                "The cell of the structure is not a diagonal supercell of the primitive cell; "
+                f"structure.cell @ inv(primitive cell) =\n{np.round(M, 4)}"
+            )
+        return mod.tolist()
+
+    def _check_commensurate(self, modes: list, mod: list) -> None:
+        """Raise if a q-point of the selected stars is not periodic in the ``mod`` supercell."""
+        for star, _ in modes:
+            phases = self.DynQs[star].qpoints * np.asarray(mod)
+            if not np.allclose(phases, np.round(phases), atol=1e-6):
+                raise ValueError(f"Star {star} has q-points that are not commensurate with the supercell {list(mod)}")
+
     def _interpolate(self, q: np.ndarray, gauge: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Fourier interpolate the force constants to ``q`` and diagonalize them.
@@ -645,15 +725,8 @@ class DynQ:
             instance.phiqs[qi] = np.reshape(values.view(np.complex128), [nat, nat, 3, 3])  # (re, im) pairs
 
         instance.dynqs = instance._phis2dyns()
-        instance.frequencies = np.empty([instance.Nqinstar, nat * 3], dtype=complex)
-        instance.polvecs = np.empty([instance.Nqinstar, nat * 3, nat * 3], dtype=complex)
-        instance.displacements = np.empty([instance.Nqinstar, nat * 3, nat * 3], dtype=complex)
-        for qi in range(instance.Nqinstar):
-            instance.frequencies[qi], instance.polvecs[qi], instance.displacements[qi] = instance._diagdynq(qi)
-        instance.frequencies = np.sqrt(instance.frequencies) * _consts.Ry2cm
-
+        instance._diagonalize()
         instance.lg_idx = _cell.get_lg_idx(instance.structure, instance.qpoints[0])  # Same for the whole star.
-        instance._find_degs()
         return instance
 
     @classmethod
@@ -702,44 +775,44 @@ class DynQ:
         masses = self.structure.masses
         return self.phiqs / np.sqrt(np.outer(masses, masses))[None, :, :, None, None]
 
-    def _diagdynq(self, qi: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _diagonalize(self) -> None:
         """
-        Diagonalize the dynamical matrix of the ``qi``-th q-point of the star.
+        Diagonalize the dynamical matrices of the star with orthonormal eigenvectors.
 
-        Returns
-        -------
-        eigenvalues : np.ndarray, [Natoms*3]
-            Eigenvalues (squared frequencies, Ry units) in ascending order.
-        polvecs : np.ndarray, [Natoms*3, Natoms*3]
-            Eigenvectors as rows.
-        displacements : np.ndarray, [Natoms*3, Natoms*3]
-            Eigenvectors divided by the square root of the atomic masses.
+        Sets ``frequencies``, ``polvecs``, ``displacements`` and ``degs`` from ``dynqs``
+        (lattice gauge). The dynamical matrix is Hermitian, so ``np.linalg.eigh`` gives
+        orthonormal modes, also inside degenerate subspaces. Two gauge choices make the
+        modes reproducible and real displacements easy to expand:
+
+        * at self-conjugate q-points (2q = G, e.g. Gamma, M, L) D(q) is real and the
+          eigenvectors are chosen real;
+        * when -q (mod G) is also in the star, its eigenvectors are taken as the complex
+          conjugate of those at q, as allowed by D(-q) = D(q)*.
         """
         nmodes = self.structure.Natoms * 3
-        D = self.dynqs[qi].transpose(0, 2, 1, 3).reshape(nmodes, nmodes)
-        eigenvalues, eigenvectors = np.linalg.eig(D)
-        return self._reorder(eigenvalues, eigenvectors)
+        matrices = self.dynqs.transpose(0, 1, 3, 2, 4).reshape(self.Nqinstar, nmodes, nmodes)
+        eigenvalues = np.empty([self.Nqinstar, nmodes])
+        self.polvecs = np.empty([self.Nqinstar, nmodes, nmodes], dtype=np.complex128)
+        for qi, q in enumerate(self.qpoints):
+            D = 0.5 * (matrices[qi] + matrices[qi].conj().T)
+            partner = self._time_reversal_partner(qi)
+            if partner is not None and np.allclose(D, matrices[partner].conj(), atol=1e-10 * np.abs(D).max()):
+                eigenvalues[qi], self.polvecs[qi] = eigenvalues[partner], self.polvecs[partner].conj()
+                continue
+            if _is_self_conjugate(q) and np.abs(D.imag).max() <= 1e-10 * np.abs(D).max():
+                D = D.real
+            values, vectors = np.linalg.eigh(D)
+            eigenvalues[qi], self.polvecs[qi] = values, vectors.T
+        self.frequencies = _eigenvalues_to_cm(eigenvalues)
+        self.displacements = self.polvecs / np.sqrt(_expanded_masses(self.structure.masses))
+        self._find_degs()
 
-    def _reorder(self, eigenvalues: np.ndarray, eigenvectors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Sort the spectrum in ascending order of the eigenvalues.
-
-        Parameters
-        ----------
-        eigenvalues : np.ndarray, [Natoms*3]
-            Eigenvalues of the dynamical matrix.
-        eigenvectors : np.ndarray, [Natoms*3, Natoms*3]
-            Eigenvectors as columns, as returned by ``np.linalg.eig``.
-
-        Returns
-        -------
-        eigenvalues, polvecs, displacements
-            Sorted eigenvalues, eigenvectors as rows and mass-scaled eigenvectors.
-        """
-        order = np.argsort(eigenvalues)
-        polvecs = eigenvectors.T[order]
-        displacements = polvecs / np.sqrt(_expanded_masses(self.structure.masses))
-        return eigenvalues[order], polvecs, displacements
+    def _time_reversal_partner(self, qi: int) -> int | None:
+        """Index of an earlier q-point of the star equal to -q[qi] modulo a reciprocal lattice vector."""
+        for qj in range(qi):
+            if _is_self_conjugate(0.5 * (self.qpoints[qi] + self.qpoints[qj])):
+                return qj
+        return None
 
     def copy(self) -> "DynQ":
         """Return a deep copy of the object."""
@@ -846,7 +919,11 @@ class DynQ:
         """
         exp_masses = _expanded_masses(self.structure.masses, mod)
         lattice_points = np.array(list(np.ndindex(*mod)))
-        phases = np.exp(2j * np.pi * (self.qpoints @ lattice_points.T))  # [Nqinstar, Ncells]
+        # q-points read from files carry round-off (e.g. -0.49999999); snap the
+        # commensurate ones to the exact grid so that e.g. zone-boundary phases are +-1.
+        scaled = self.qpoints * np.asarray(mod)
+        qpoints = np.where(np.abs(scaled - np.round(scaled)) < 1e-6, np.round(scaled) / np.asarray(mod), self.qpoints)
+        phases = np.exp(2j * np.pi * (qpoints @ lattice_points.T))  # [Nqinstar, Ncells]
 
         polvecs_list = np.empty(len(modes), dtype=object)
         displacements_list = np.empty(len(modes), dtype=object)
@@ -872,6 +949,11 @@ class DynQ:
 def _expanded_masses(masses: np.ndarray, mod: list = (1, 1, 1)) -> np.ndarray:
     """Masses repeated for each cartesian component and each cell of the ``mod`` supercell."""
     return np.tile(np.repeat(masses, 3), int(np.prod(mod)))
+
+
+def _is_self_conjugate(q: np.ndarray, tol: float = 1e-6) -> bool:
+    """True when -q equals q modulo a reciprocal lattice vector (q in fractional units)."""
+    return bool(np.allclose(2 * np.asarray(q), np.round(2 * np.asarray(q)), atol=tol))
 
 
 def _eigenvalues_to_cm(eigenvalues: np.ndarray) -> np.ndarray:
