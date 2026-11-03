@@ -6,6 +6,7 @@ import numpy as np
 import spglib
 import ase
 import cellconstructor as CC
+import cellconstructor.Methods
 import cellconstructor.Structure
 import copy
 
@@ -81,7 +82,14 @@ class Structure:
             data = (open(file, "r")).readlines()
             instance.Nspecies = int((data[2].split())[0])
             instance.Natoms = int((data[2].split())[1])
+            ibrav = int((data[2].split())[2])
             alat = float((data[2].split())[3]) * _consts.bohr2angstroms
+            if ibrav != 0:
+                # No "Basis vectors" block: build the cell from ibrav and celldm with QE's
+                # conventions and insert it, so the line indices below still hold.
+                celldm = np.array((data[2].split())[3:9], dtype=float)
+                cell = CC.Methods.get_unit_cell_from_ibrav(ibrav, celldm) / alat
+                data = data[:3] + ["Basis vectors\n"] + ["{} {} {}\n".format(*row) for row in cell] + data[3:]
             tmp_atom_coords = np.empty([instance.Natoms, 3])
             tmp_cell = np.empty([3, 3])
             instance.masses = np.empty([instance.Natoms])

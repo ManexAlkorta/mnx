@@ -16,7 +16,11 @@ masses in Ry atomic units, lengths in Angstrom and frequencies in cm^-1. Imagina
 frequencies are stored as complex numbers and reported as negative values in band
 structures.
 
-See ``Tutorial/DynMatrix.ipynb`` for a guided tour.
+Polar insulators (dyn files with a dielectric tensor and Born effective charges) get the
+long-range dipole-dipole correction and the LO-TO splitting at Gamma, see ``zeff``,
+``epsilon`` and ``apply_nac`` in :class:`DynMatrix`.
+
+See ``Tutorial/DynMatrix.ipynb`` for a guided tour and ``docs/dyn_matrix.md`` for the equations.
 """
 
 from __future__ import annotations
@@ -39,6 +43,9 @@ import mnx.utils.consts as _consts
 from mnx.FModules import interpolation as _interpolation
 
 from .structure import Structure
+
+# Cutoff of the Ewald sum of the long-range force constants, as in QuantumESPRESSO's rgd_blk.
+_EWALD_GMAX = 14.0
 
 
 class DynMatrix:
@@ -66,11 +73,39 @@ class DynMatrix:
     qstars : np.ndarray of np.ndarray, [Nqirr]
         q-points of each star in fractional units, ``qstars[s]`` has shape [Nqinstar, 3].
     phiR : np.ndarray, [Nat_sc, Nat_sc, 3, 3]
-        Real-space force constants of the supercell.
+        Real-space force constants of the supercell. When ``apply_nac`` is True they are
+        the short-range part only: the long-range dipole-dipole term is removed before
+        the Fourier transform and added back analytically at every q.
+    zeff : np.ndarray, [Natoms, 3, 3] or None
+        Born effective charges in units of e, ``zeff[a, i, j]`` = dF_aj / dE_i (the
+        "E-U" block of QuantumESPRESSO), after the charge sum rule. None for non-polar
+        inputs.
+    epsilon : np.ndarray, [3, 3] or None
+        High-frequency (electronic) dielectric tensor. None for non-polar inputs.
+    apply_nac : bool
+        Whether the non-analytic correction (long-range dipole-dipole term and LO-TO
+        splitting) is applied. True by default when ``zeff`` and ``epsilon`` are present;
+        setting it rebuilds ``phiR``.
     """
 
+    zeff = None
+    epsilon = None
+    _apply_nac = False
+
+    @property
+    def apply_nac(self) -> bool:
+        return self._apply_nac
+
+    @apply_nac.setter
+    def apply_nac(self, value: bool) -> None:
+        if value and (self.zeff is None or self.epsilon is None):
+            raise ValueError("apply_nac needs the effective charges (zeff) and the dielectric tensor (epsilon)")
+        self._apply_nac = bool(value)
+        if getattr(self, "super_structure", None) is not None:
+            self.get_phiR()
+
     @classmethod
-    def from_file(cls, file: str, qgrid: list | None = None, Nqirr: int = 0) -> "DynMatrix":
+    def from_file(cls, file: str, qgrid: list | None = None, Nqirr: int = 0, zasr: str = "simple") -> "DynMatrix":
         """
         Read the phonon spectra from a set of QuantumESPRESSO ``dyn`` files.
 
@@ -85,6 +120,10 @@ class DynMatrix:
         Nqirr : int, optional
             Number of irreducible q-points in the grid. With ``Nqirr=0`` (default) only
             the single file ``file`` is read and no real-space force constants are built.
+        zasr : {"simple", "no"}, optional
+            Charge sum rule imposed on the effective charges, if the files have them.
+            ``"simple"`` (default) subtracts the average charge so that sum_a Z_a = 0, as
+            ``zasr='simple'`` in QuantumESPRESSO's q2r.x; ``"no"`` keeps them as read.
 
         Returns
         -------
@@ -109,6 +148,13 @@ class DynMatrix:
         instance.Nqpoints = sum(dynq.Nqinstar for dynq in instance.DynQs)
         instance._alat = instance.DynQs[0]._alat
 
+        # QuantumESPRESSO writes the dielectric tensor and the effective charges in the Gamma file.
+        polar = [dynq for dynq in instance.DynQs if dynq.zeff is not None and dynq.epsilon is not None]
+        if polar:
+            instance.epsilon = polar[0].epsilon.copy()
+            instance.zeff = _charge_sum_rule(polar[0].zeff, zasr)
+            instance._apply_nac = True
+
         if Nqirr > 0:
             instance.super_structure = instance.structure.expand_structure(instance.qgrid)
             instance.get_phiR()
@@ -121,7 +167,8 @@ class DynMatrix:
 
         The structure is read from ``primPOSCAR`` (falling back to ``POSCAR``) and the
         force constants from ``phonopy_disp.yaml`` (falling back to ``phonopy.yaml``) inside
-        ``folder``.
+        ``folder``. Effective charges (phonopy ``BORN`` files) are not read yet, so no
+        non-analytic correction is applied.
 
         Parameters
         ----------
@@ -338,14 +385,19 @@ class DynMatrix:
 
         Stores the result in ``self.phiR`` with shape [Nat_sc, Nat_sc, 3, 3]. The
         transform is done by the Fortran routine ``FModules.interpolation.ift_fcq``.
+        With ``apply_nac`` the long-range dipole-dipole term is subtracted from every
+        q-point first, so ``phiR`` holds the short-range force constants. Call it again
+        after changing ``zeff`` or ``epsilon``.
         """
         phiqs = np.concatenate([dynq.phiqs for dynq in self.DynQs])
         qpoints = np.concatenate([dynq.qpoints for dynq in self.DynQs])
+        if self.apply_nac:
+            phiqs = phiqs - np.array([self._long_range(q, "lattice") for q in qpoints])
         self.phiR = np.real(
             _interpolation.ift_fcq(phiqs, qpoints, self.structure.cell, self.super_structure.atom_coords, "lattice")
         )
 
-    def get_dynq(self, q: list, gauge: str = "atomic") -> "DynQ":
+    def get_dynq(self, q: list, gauge: str = "atomic", direction: list | None = None) -> "DynQ":
         r"""
         Interpolate the force constants :math:`\Phi(q)` to an arbitrary q-point.
 
@@ -355,14 +407,22 @@ class DynMatrix:
             q-point in fractional units.
         gauge : {"atomic", "lattice"}, optional
             Gauge of the Fourier interpolation. Defaults to ``"atomic"``.
+        direction : array_like, [3], optional
+            Direction of approach to Gamma in fractional units, used for the LO-TO
+            splitting when ``q`` is Gamma (or a reciprocal lattice vector) and
+            ``apply_nac`` is True. Ignored elsewhere. Without it Gamma is analytic.
 
         Returns
         -------
         DynQ
-            Single-point star with the interpolated spectrum.
+            Single-point star with the interpolated spectrum. Its ``direction`` attribute
+            holds the direction used for the non-analytic term, or None.
         """
-        phiq, eigenvalues, polvecs = self._interpolate(q, gauge)
-        return DynQ.from_data(self.structure, np.array([q]), np.array([phiq]), np.array([eigenvalues]), np.array([polvecs]))
+        phiq, eigenvalues, polvecs = self._interpolate(q, gauge, direction)
+        dynq = DynQ.from_data(self.structure, np.array([q]), np.array([phiq]), np.array([eigenvalues]), np.array([polvecs]))
+        if self.apply_nac and direction is not None and _is_gamma(q):
+            dynq.direction = np.asarray(direction, dtype=float)
+        return dynq
 
     def get_bands(self, k_inpath: np.ndarray, N: int, gauge: str = "atomic") -> tuple[np.ndarray, np.ndarray, list]:
         """
@@ -387,11 +447,17 @@ class DynMatrix:
             Accumulated cartesian length along the path, for plotting.
         xticks : list of float
             Values of ``cart_qpath`` at the segment boundaries.
+
+        Notes
+        -----
+        With ``apply_nac``, a Gamma point takes the direction of its own segment for the
+        LO-TO splitting, so Gamma between two segments shows the limit from each side.
         """
         qpath, cart_qpath, xticks = self._build_qpath(k_inpath, N)
+        directions = self._segment_directions(k_inpath, N)
         bands = np.empty([len(qpath), self.structure.Natoms * 3], dtype=np.float64)
         for qi, q in enumerate(qpath):
-            _, eigenvalues, _ = self._interpolate(q, gauge)
+            _, eigenvalues, _ = self._interpolate(q, gauge, directions[qi])
             bands[qi] = _signed_frequencies(_eigenvalues_to_cm(eigenvalues))
         return bands, cart_qpath, xticks
 
@@ -423,12 +489,13 @@ class DynMatrix:
             Structure factor of each mode.
         """
         qpath, cart_qpath, xticks = self._build_qpath(k_inpath, N)
+        directions = self._segment_directions(k_inpath, N)
         nmodes = self.structure.Natoms * 3
         masses = self.structure.masses
         bands = np.empty([len(qpath), nmodes], dtype=np.float64)
         structure_factor = np.empty([len(qpath), nmodes], dtype=np.float64)
         for qi, q in enumerate(qpath):
-            _, eigenvalues, polvecs = self._interpolate(q, "atomic")
+            _, eigenvalues, polvecs = self._interpolate(q, "atomic", directions[qi])
             frequencies = _eigenvalues_to_cm(eigenvalues)
             bands[qi] = _signed_frequencies(frequencies)
 
@@ -629,18 +696,61 @@ class DynMatrix:
             if not np.allclose(phases, np.round(phases), atol=1e-6):
                 raise ValueError(f"Star {star} has q-points that are not commensurate with the supercell {list(mod)}")
 
-    def _interpolate(self, q: np.ndarray, gauge: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _interpolate(self, q: np.ndarray, gauge: str, direction: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Fourier interpolate the force constants to ``q`` and diagonalize them.
+
+        With ``apply_nac`` the long-range term is added to the short-range ``phiR``, and
+        at Gamma the non-analytic term along ``direction`` (fractional), if given.
 
         Returns the force constants [Natoms, Natoms, 3, 3], the eigenvalues of the
         dynamical matrix [Natoms*3] (Ry units, ascending) and the eigenvectors as rows
         [Natoms*3, Natoms*3].
         """
-        phiq, eigenvalues, polvecs = _interpolation.ft_fcr(
-            self.phiR, q, self.structure.masses, self.qgrid, self.structure.cell, self.super_structure.atom_coords, gauge
+        if not self.apply_nac:
+            phiq, eigenvalues, polvecs = _interpolation.ft_fcr(
+                self.phiR, q, self.structure.masses, self.qgrid, self.structure.cell, self.super_structure.atom_coords, gauge
+            )
+            return phiq, eigenvalues, np.transpose(polvecs)
+
+        phiq = _interpolation.ft_phir(
+            self.phiR, q, self.qgrid, self.structure.cell, self.super_structure.atom_coords, gauge, self.structure.Natoms
         )
+        phiq = phiq + self._long_range(q, gauge)
+        if direction is not None and _is_gamma(q):
+            phiq = phiq + self._nonanalytic(direction)
+        eigenvalues, polvecs = _interpolation.diag_dynq(phiq, self.structure.masses)
         return phiq, eigenvalues, np.transpose(polvecs)
+
+    def _long_range(self, q: np.ndarray, gauge: str) -> np.ndarray:
+        """
+        Long-range dipole-dipole force constants at ``q`` (fractional), [Natoms, Natoms, 3, 3] in Ry/bohr^2.
+
+        Ewald sum of Fortran ``dipole_dipole`` with QuantumESPRESSO's parameters: alpha =
+        (2 pi / alat)^2 with alat = |a1| and a cutoff exp(-|G|^2 / 4 alpha) > exp(-14).
+        """
+        to_bohr = _consts.angstroms2bohr
+        alat = np.linalg.norm(self.structure.cell[0]) * to_bohr
+        rcell = 2 * np.pi * self.structure.rcell / to_bohr
+        q_cart = np.asarray(q, dtype=float) @ rcell
+        return _interpolation.dipole_dipole(
+            q_cart, self.structure.atom_coords * to_bohr, rcell, self.epsilon, self.zeff,
+            self._volume_bohr(), (2 * np.pi / alat) ** 2, _EWALD_GMAX, gauge,
+        )
+
+    def _nonanalytic(self, direction: np.ndarray) -> np.ndarray:
+        """Non-analytic force constants at Gamma along ``direction`` (fractional), [Natoms, Natoms, 3, 3] in Ry/bohr^2."""
+        qhat = np.asarray(direction, dtype=float) @ self.structure.rcell
+        return _interpolation.nonanalytic(qhat, self.epsilon, self.zeff, self._volume_bohr())
+
+    def _volume_bohr(self) -> float:
+        """Volume of the primitive cell in bohr^3."""
+        return abs(np.linalg.det(self.structure.cell)) * _consts.angstroms2bohr**3
+
+    def _segment_directions(self, k_inpath: np.ndarray, N: int) -> list:
+        """Direction of the segment of every point of ``_build_qpath(k_inpath, N)``, for the LO-TO splitting at Gamma."""
+        k_inpath = np.asarray(k_inpath, dtype=float)
+        return [k_end - k_start for k_start, k_end in k_inpath for _ in range(N + 1)]
 
     def _build_qpath(self, k_inpath: np.ndarray, N: int) -> tuple[np.ndarray, np.ndarray, list]:
         """
@@ -698,7 +808,19 @@ class DynQ:
         Indices of the spglib symmetries of the little group of the star.
     degs : np.ndarray, [Natoms*3, Natoms*3], bool
         ``degs[mu, nu]`` is True when modes ``mu`` and ``nu`` are degenerate.
+    zeff : np.ndarray, [Natoms, 3, 3] or None
+        Born effective charges as written in the file ("E-U" block, no sum rule), only
+        in the Gamma file of a polar material.
+    epsilon : np.ndarray, [3, 3] or None
+        High-frequency dielectric tensor, only in the Gamma file of a polar material.
+    direction : np.ndarray, [3] or None
+        For a Gamma point from :meth:`DynMatrix.get_dynq`, the direction (fractional)
+        used for the LO-TO splitting. None means the analytic dynamical matrix.
     """
+
+    zeff = None
+    epsilon = None
+    direction = None
 
     @classmethod
     def from_file(cls, file: str) -> "DynQ":
@@ -736,6 +858,7 @@ class DynQ:
             block = tokens[row + 1 : row + 1 + 4 * nat * nat]
             values = np.array([line for k, line in enumerate(block) if k % 4], dtype=np.float64)
             instance.phiqs[qi] = np.reshape(values.view(np.complex128), [nat, nat, 3, 3])  # (re, im) pairs
+        instance.epsilon, instance.zeff = _read_effective_charges(lines, nat)
 
         instance.dynqs = instance._phis2dyns()
         instance._diagonalize()
@@ -851,6 +974,7 @@ class DynQ:
         fmt_q = "     q = ( {0:14.9f}{1:14.9f}{2:14.9f} )\n\n"
         fmt_freq = "     freq ({0:>4d}) = {1:14.6f} [THz] = {2:14.6f} [cm-1]\n"
         fmt_mode = "({0:10.6f}{1:10.6f}{2:10.6f}{3:10.6f}{4:10.6f}{5:10.6f} )\n"
+        fmt_tensor = "{0:24.12f}{1:24.12f}{2:24.12f}\n"
 
         structure = self.structure
         nat = structure.Natoms
@@ -880,6 +1004,17 @@ class DynQ:
                         f.write("{0:>5d}{1:>5d}\n".format(i + 1, j + 1))
                         for row in self.phiqs[qi, i, j]:
                             f.write(fmt_dyn_matrix.format(*np.column_stack([row.real, row.imag]).ravel()))
+
+            if self.epsilon is not None:
+                f.write("\n     Dielectric Tensor:\n\n")
+                for row in self.epsilon:
+                    f.write(fmt_tensor.format(*row))
+            if self.zeff is not None:
+                f.write("\n     Effective Charges E-U: Z_{alpha}{s,beta}\n\n")
+                for atom in range(nat):
+                    f.write(f"     atom # {atom + 1:4d}\n")
+                    for row in self.zeff[atom]:
+                        f.write(fmt_tensor.format(*row))
 
             f.write("\n     Diagonalizing the dynamical matrix\n\n")
             f.write(fmt_q.format(*(self.qpoints_cart[0] * norm)))
@@ -962,6 +1097,40 @@ class DynQ:
 def _expanded_masses(masses: np.ndarray, mod: list = (1, 1, 1)) -> np.ndarray:
     """Masses repeated for each cartesian component and each cell of the ``mod`` supercell."""
     return np.tile(np.repeat(masses, 3), int(np.prod(mod)))
+
+
+def _read_effective_charges(lines: list, nat: int) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Dielectric tensor [3, 3] and "E-U" effective charges [nat, 3, 3] of a split dyn file, or None.
+
+    Only the "E-U" block (Z_{alpha}{s,beta}, field index first) is read; the "U-E" block
+    that ph.x also writes is skipped, as in QuantumESPRESSO's q2r.x.
+    """
+    epsilon = zeff = None
+    for i, line in enumerate(lines):
+        text = " ".join(line)
+        if text.startswith("Dielectric Tensor"):
+            rows = [row for row in lines[i + 1 :] if row][:3]
+            epsilon = np.array(rows, dtype=float)
+        elif text.startswith("Effective Charges E-U"):
+            rows = [row for row in lines[i + 1 :] if row][: 4 * nat]
+            zeff = np.array([row for k, row in enumerate(rows) if k % 4], dtype=float).reshape(nat, 3, 3)
+    return epsilon, zeff
+
+
+def _is_gamma(q: np.ndarray, tol: float = 1e-6) -> bool:
+    """True if the fractional ``q`` is Gamma or a reciprocal lattice vector."""
+    q = np.asarray(q, dtype=float)
+    return bool(np.allclose(q, np.round(q), atol=tol))
+
+
+def _charge_sum_rule(zeff: np.ndarray, zasr: str) -> np.ndarray:
+    """Effective charges with the sum rule ``zasr`` ("simple": sum_a Z_a = 0 by removing the average; "no")."""
+    if zasr == "simple":
+        return zeff - zeff.mean(axis=0)[None, :, :]
+    if zasr == "no":
+        return zeff.copy()
+    raise ValueError(f"Unknown zasr '{zasr}', use 'simple' or 'no'")
 
 
 def _is_self_conjugate(q: np.ndarray, tol: float = 1e-6) -> bool:

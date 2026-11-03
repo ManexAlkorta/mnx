@@ -23,6 +23,12 @@ def crsb():
     return mnx.DynMatrix.from_file(str(DYNS / "CrSb" / "750" / "hessianv4_"), qgrid=[2, 2, 2], Nqirr=4)
 
 
+@pytest.fixture(scope="session")
+def mnte():
+    """MnTe phonons on a 2x2x2 grid (4 irreducible q-points), a polar insulator with LO-TO splitting."""
+    return mnx.DynMatrix.from_file(str(DYNS / "MnTe" / "dyn"), qgrid=[2, 2, 2], Nqirr=4)
+
+
 def read_matdyn_freq(file):
     """
     Read a ``flfrq`` file written by QuantumESPRESSO's matdyn.x.

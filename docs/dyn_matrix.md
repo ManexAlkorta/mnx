@@ -13,6 +13,7 @@ through the same features on real data.
 - [Objects and data layout](#objects-and-data-layout)
 - [Units and conventions](#units-and-conventions)
 - [Equations](#equations)
+- [Polar materials: LO–TO splitting](#polar-materials-loto-splitting)
 - [Plotting with `mnx.io`](#plotting-with-mnxio)
 - [Validation](#validation)
 - [Known limitations](#known-limitations)
@@ -68,13 +69,16 @@ names below.
 | `Nqirr`, `Nqpoints` | – | number of stars and of q-points in the grid |
 | `DynQs` | `[Nqirr]` | one `DynQ` per star |
 | `qstars` | `[Nqirr]` of `[Nqinstar, 3]` | fractional q-points of each star |
-| `phiR` | `[A, B, α, β]` | real-space force constants |
+| `phiR` | `[A, B, α, β]` | real-space force constants (short-range part only when `apply_nac`) |
+| `zeff` | `[a, α, β]` or `None` | Born effective charges Z*, after the charge sum rule ([LO–TO](#polar-materials-loto-splitting)) |
+| `epsilon` | `[α, β]` or `None` | high-frequency dielectric tensor ε∞ |
+| `apply_nac` | bool | apply the non-analytic correction; `True` by default when `zeff` and `epsilon` exist |
 
 | Method | Does |
 |---|---|
-| `from_file(prefix, qgrid, Nqirr)` | reads QE dyn files `prefix1 … prefixNqirr` (or one file when `Nqirr=0`) |
+| `from_file(prefix, qgrid, Nqirr, zasr)` | reads QE dyn files `prefix1 … prefixNqirr` (or one file when `Nqirr=0`) |
 | `from_phonopy(folder, qgrid)` | reads a VASP + phonopy calculation |
-| `get_dynq(q, gauge)` | spectrum at any q, as a one-point `DynQ` |
+| `get_dynq(q, gauge, direction)` | spectrum at any q, as a one-point `DynQ`; `direction` sets the LO–TO limit at Γ |
 | `get_bands(k_inpath, N, gauge)` | dispersion along a path |
 | `get_bands_with_SF(k_inpath, N, Q)` | dispersion and one-phonon structure factor at `Q + k` |
 | `expand_polvecs(modes, mod)` | polarization vectors and displacements on a supercell |
@@ -98,6 +102,8 @@ names below.
 | `degs` | `[ν, ν]` bool | degenerate pairs (\|Δω\| < 10⁻³ cm⁻¹) |
 | `lg_idx` | list | spglib indices of the little group of the star |
 | `Pmn`, `traces` | `[ν, ν, S]`, `[ν, S]` | set by `get_Pmn` / `compute_traces` |
+| `zeff`, `epsilon` | `[a, α, β]`, `[α, β]` | charges and ε∞ as written in the file (Γ star of a polar material only, else `None`) |
+| `direction` | `[3]` or `None` | for a Γ `DynQ` from `get_dynq`: fractional direction used for the LO–TO splitting |
 
 ## Units and conventions
 
@@ -110,6 +116,8 @@ names below.
 | Masses | Rydberg atomic units: m = m[amu] × 911.444 (as in QE dyn files) |
 | Force constants Φ | Ry/bohr² |
 | Eigenvalues λ = ω² | Ry² (Rydberg atomic units, ħ = 1) |
+| Born effective charges Z* | units of e; `zeff[a, α, β]` = ∂F_aβ/∂E_α (field index first, QE's "E-U" block) |
+| Dielectric tensor ε∞ | dimensionless, electronic (clamped-ion) |
 | Frequencies | cm⁻¹: ω = √λ × 109 737.36 (`consts.Ry2cm`); THz = cm⁻¹ × 0.0299792458 |
 | Imaginary modes | stored as complex ω = i\|ω\|; `get_bands` and `write` report them as −\|ω\| |
 | Band-path distance `qpath` | 10 × cumulative \|Δ**k**\| in Å⁻¹ without 2π, i.e. nm⁻¹ |
@@ -155,7 +163,10 @@ Interpolated spectra (`get_dynq`, `get_bands`) come from LAPACK `zheev` in the F
 ### Reading the input
 
 - **QuantumESPRESSO** (`from_file`): Φ(**q**) is read as written in each dyn file (one file per
-  star, all q-points of the star). Masses, cell and positions come from the header.
+  star, all q-points of the star). Masses, cell and positions come from the header, with
+  either `ibrav = 0` (explicit "Basis vectors") or `ibrav ≠ 0` + `celldm` (built with
+  QE's conventions through CellConstructor). The dielectric tensor and the "E-U" effective
+  charges are read from the Γ file when present.
 - **phonopy** (`from_phonopy`): phonopy's D(**q**) in eV/Å²/amu is evaluated at every point of
   `qgrid` and converted to Φ(**q**) = D(**q**)·√(m_a m_b) in Ry/bohr² (× 0.0205817 × 2/1822.89).
   Every grid point is stored as a star of its own.
@@ -299,6 +310,116 @@ kept only for degenerate pairs (μ, ν) and zero otherwise. `compute_traces` giv
 character of each mode, i.e. the trace over its degenerate block:
 χ_μ(S) = Σ_{ν ∈ deg(μ)} P_νν(S).
 
+## Polar materials: LO–TO splitting
+
+In a polar insulator the atoms carry Born effective charges Z*, and a displacement
+creates a dipole. Dipoles interact as 1/r³, so the force constants have a long-range
+tail that a Fourier interpolation from a coarse grid can't represent. At **q** → 0 the
+long-range interaction adds a term that depends on the **direction** of **q**: the
+macroscopic electric field of longitudinal optical (LO) modes raises their frequency
+above the transverse (TO) ones. That is the **LO–TO splitting**, and it makes the
+dispersion discontinuous at Γ.
+
+`mnx` follows X. Gonze and C. Lee, PRB **55**, 10355 (1997), exactly as QuantumESPRESSO's
+`q2r.x` / `matdyn.x` (routines `rgd_blk` and `nonanal`).
+
+### Input
+
+QuantumESPRESSO's `ph.x` (with `epsil = .true.`) writes ε∞ and Z* at the end of the Γ dyn
+file. `from_file` reads them into `DynQ.epsilon` / `DynQ.zeff` of the Γ star and, if found,
+sets `DynMatrix.epsilon`, `DynMatrix.zeff` and `apply_nac = True`. Only the "E-U" block
+(Z_{α}{s,β}, field index first) is read, as in `q2r.x`; the "U-E" block is skipped.
+
+**Charge sum rule.** Charge neutrality requires Σ_a Z*_a = 0, which DFPT satisfies only
+approximately (MnTe: ~10⁻³ e). `from_file(..., zasr="simple")` (the default) removes the
+average, Z*_a ← Z*_a − (1/N) Σ_b Z*_b, as `zasr = 'simple'` in `q2r.x`. `zasr="no"` keeps the
+charges as read; `DynQ.zeff` and `write` always keep the raw values.
+
+### Equations
+
+Units are Rydberg atomic units: e² = 2, Ω is the cell volume in bohr³, **q** and **G** are
+cartesian and include 2π.
+
+**Long-range (dipole–dipole) term**, an Ewald sum over reciprocal lattice vectors **G**:
+
+$$
+\Phi^{\mathrm{LR}}_{ab,\alpha\beta}(\mathbf q) = \frac{4\pi e^2}{\Omega} \Bigg[
+\sum_{\mathbf K = \mathbf q + \mathbf G \neq 0}
+\frac{(\mathbf K \cdot Z_a)_\alpha (\mathbf K \cdot Z_b)_\beta}{\mathbf K \cdot \varepsilon_\infty \cdot \mathbf K}\,
+e^{-\mathbf K \cdot \varepsilon_\infty \cdot \mathbf K / 4\Lambda}\, e^{i \mathbf K \cdot (\boldsymbol\tau_a - \boldsymbol\tau_b)}
+\;-\; \delta_{ab} \sum_{\mathbf G \neq 0} \sum_c
+\frac{(\mathbf G \cdot Z_a)_\alpha (\mathbf G \cdot Z_c)_\beta}{\mathbf G \cdot \varepsilon_\infty \cdot \mathbf G}\,
+e^{-\mathbf G \cdot \varepsilon_\infty \cdot \mathbf G / 4\Lambda} \cos\big(\mathbf G \cdot (\boldsymbol\tau_a - \boldsymbol\tau_c)\big)
+\Bigg],
+$$
+
+with (**q**·Z_a)_β = Σ_α q_α Z*_{a,αβ}. The second sum makes Φᴸᴿ vanish for a rigid
+translation. As in QE, only the reciprocal-space part is kept: the Ewald parameter is
+Λ = (2π/alat)² with alat = \|**a**₁\|, and terms with **K**·ε∞·**K** / 4Λ > 14
+(e⁻¹⁴ ≈ 10⁻⁶) are dropped. The sum excludes **K** = 0, so Φᴸᴿ is smooth and Φᴸᴿ(Γ) is analytic.
+This is the **lattice gauge** (periodic in **q**). In the **atomic gauge** it is multiplied by
+e^{i**q**·(**τ**_b − **τ**_a)}, the same phase that relates Φ(**q**) in the two gauges.
+
+**Non-analytic term** at Γ, approached along **q̂**:
+
+$$
+\Phi^{\mathrm{NA}}_{ab,\alpha\beta}(\hat{\mathbf q}) = \frac{4\pi e^2}{\Omega}\,
+\frac{(\hat{\mathbf q} \cdot Z_a)_\alpha (\hat{\mathbf q} \cdot Z_b)_\beta}{\hat{\mathbf q} \cdot \varepsilon_\infty \cdot \hat{\mathbf q}} .
+$$
+
+It is the **K** = **q** → 0 term of the sum above, which is why ω(**q** → 0 along **q̂**) is
+continuous with ω(Γ, **q̂**) (`test_loto_limit_is_continuous`).
+
+### Workflow
+
+1. `get_phiR` subtracts Φᴸᴿ(**q**) from every grid point, then Fourier transforms the
+   short-range part Φˢᴿ = Φ − Φᴸᴿ. `phiR` holds Φˢᴿ, which decays fast in real space.
+2. `get_dynq` / `get_bands` / `get_bands_with_SF` interpolate Φˢᴿ to **q** (Fortran
+   `ft_phir`), add Φᴸᴿ(**q**) (Fortran `dipole_dipole`) and, at Γ (or any **G**) with a
+   direction, Φᴺᴬ(**q̂**) (Fortran `nonanalytic`), then diagonalize (`diag_dynq`).
+
+On the grid points this gives back the input dyn files exactly (`test_grid_points_reproduced`).
+`Symmetrize` symmetrizes Φˢᴿ and rebuilds the grid matrices with Φᴸᴿ added back.
+
+### Direction at Γ
+
+- `get_dynq([0, 0, 0])` without `direction` gives the **analytic** dynamical matrix (TO
+  frequencies, as printed by `ph.x` in the Γ dyn file). `get_dynq([0, 0, 0], direction=u)`
+  adds Φᴺᴬ along the fractional direction `u`; the result's `DynQ.direction` records it.
+- `get_bands` gives each Γ point the direction of **its own segment**. Since segment ends are
+  repeated, a Γ between two segments shows the limit from both sides, e.g. Γ in
+  K→Γ→A has the in-plane LO frequency at the end of K→Γ and the z one at the start of Γ→A.
+  `matdyn.x` gives the same values on the same list of points (it takes the direction from
+  the previous point, or from the next one when the previous point is also Γ).
+
+### Switching it off
+
+```python
+dyn = mnx.DynMatrix.from_file("./dyns/MnTe/dyn", qgrid=[2, 2, 2], Nqirr=4)
+bands_nac, qpath, xticks = dyn.get_bands(k_inpath, N=50)
+
+dyn.apply_nac = False          # rebuilds phiR from the full Phi(q); the charges are kept
+bands_plain, _, _ = dyn.get_bands(k_inpath, N=50)
+```
+
+Setting `apply_nac` rebuilds `phiR`. After changing `zeff` or `epsilon` by hand call
+`dyn.get_phiR()`.
+
+### Example: MnTe
+
+NiAs-type MnTe (`Tutorial/dyns/MnTe`, 2×2×2 grid) has ε∞ ≈ diag(14.23, 14.23, 14.44)
+and Z*(Mn) ≈ +2.82 (in-plane), +2.59 (z). At Γ (cm⁻¹):
+
+| Mode | Analytic (TO) | **q̂** ∥ x (Γ→M) | **q̂** ∥ z (Γ→A) |
+|---|---|---|---|
+| E₁ᵤ (in-plane dipole) | 134.93 (×2) | 134.93 + **179.83** | 134.93 (×2) |
+| A₂ᵤ (dipole along z) | 128.55 | 128.55 | **168.14** |
+| Non-polar modes | 93.21, 96.38, 121.13, 180.89 | unchanged | unchanged |
+
+Without the correction the LO modes are wrong near Γ: on this coarse grid the
+interpolated bands change by up to 45 cm⁻¹ at **q** = (0.025, 0, 0), next to Γ
+(`test_apply_nac_switch`).
+
 ## Plotting with `mnx.io`
 
 All helpers take the outputs of `get_bands` / `get_bands_with_SF` unchanged, draw on a
@@ -349,6 +470,9 @@ The tests in [`tests/`](../tests) run on every pull request (`.github/workflows/
 | `test_interpolation.py::test_bands_match_quantum_espresso` | QE `matdyn.x`, RbH12 3×3×3, 901 q-points (inputs and output in `tests/data/RbH12_3x3x3`) | < 0.01 cm⁻¹ (max 0.002) |
 | `test_phonopy.py::test_interpolation_matches_phonopy` | phonopy, on and off the 2×2×2 grid | < 0.01 cm⁻¹ (max 1e-4) |
 | `test_interpolation.py::test_grid_points_reproduce_dyn_files` | input dyn files, both gauges | < 1e-3 cm⁻¹ |
+| `test_loto.py::test_bands_match_quantum_espresso` | QE 6.7 `q2r.x` (`zasr='simple'`) + `matdyn.x` (`asr='no'`), MnTe 2×2×2 with LO–TO, 168 q-points with Γ reached along 4 directions (`tests/data/MnTe_2x2x2`) | < 1e-3 cm⁻¹ (max 1.1e-4) |
+| `test_loto.py::test_bands_match_cellconstructor` | CellConstructor `ForceTensor.Tensor2`, same path, `zasr="no"` (`tests/data/MnTe_2x2x2/make_cc_reference.py`) | < 1e-4 cm⁻¹ (max 7e-6) |
+| `test_loto.py` (other tests) | charges and ε∞ read and written back; charge sum rule; hexagonal `ibrav=4` cell; grid points reproduced with Φᴸᴿ in both gauges; analytic Γ = `ph.x`; Φᴺᴬ vs an independent NumPy formula; ω(**q** → 0) continuous; gauge phase of Φᴸᴿ; `apply_nac` switch | see the tests |
 | `test_io.py` | `mnx.io` with real and synthetic bands | exact |
 | `test_projection.py` | `distort_structure` → shuffle atoms → `project_structure` returns the input Q; modes orthonormal; integer characters; errors | < 1e-9 |
 
@@ -356,11 +480,15 @@ Run them locally from the repository root with `python -m pytest -v`.
 
 ## Known limitations
 
-- **Single precision phases**: the Fortran interpolation stores the Fourier phases as
-  single-precision `complex` (`phase`, `phase_weight` in `interpolation.f90`). That limits
-  the relative accuracy to ~10⁻⁷, which is still well below the QE comparison tolerance.
-- **No non-analytic correction**: there is no LO–TO splitting term for polar materials, and
-  no acoustic sum rule is imposed on Φ.
+- **No acoustic sum rule** is imposed on Φ, so acoustic modes at Γ are not exactly zero
+  (MnTe: 2.9 and 7.2 cm⁻¹). Compare with `matdyn.x` using `asr='no'`.
+- **LO–TO splitting, 3D only**: no 2D Coulomb cutoff (QE's `loto_2d`) for layers in vacuum.
+- **Effective charges are not symmetrized**: `Symmetrize` acts on Φˢᴿ only; ε∞ and Z* are
+  used as read (plus the charge sum rule).
+- **phonopy**: `from_phonopy` does not read `BORN` files yet, so phonopy inputs get no
+  non-analytic correction.
+- **Frequency conversion**: `consts.Ry2cm` differs from QE's Ry → cm⁻¹ factor by 4·10⁻⁷
+  (relative), visible only in the last printed digits.
 - **`project_structure` memory**: atom matching builds an Nₐₜ × Nₐₜ distance table, which is
   fine up to a few thousand atoms in the supercell.
 - **`_alat` units**: Å after `from_file` / `from_phonopy`, bohr after `change_cell`.
