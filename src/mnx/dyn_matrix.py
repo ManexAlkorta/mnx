@@ -462,11 +462,24 @@ class DynMatrix:
         return bands, cart_qpath, xticks
 
     def get_bands_with_SF(self, k_inpath: np.ndarray, N: int, Q: list) -> tuple[np.ndarray, np.ndarray, list, np.ndarray]:
-        """
+        r"""
         Compute the phonon dispersion and the one-phonon structure factor along a path.
 
-        The structure factor of each mode is evaluated at the momentum ``Q + k``, with
-        ``k`` running along the path and the atomic gauge for the interpolation.
+        The structure factor of each mode is evaluated at the total momentum transfer
+        ``K = Q + k``, with ``k`` running along the path. It is Eq. (2) of the
+        Supplementary Information of A. Korshunov, M. Alkorta et al., arXiv:2603.25317
+        (atomic form factors f_a = 1, no Debye-Waller factor):
+
+        .. math::
+
+            F_\nu(\mathbf K) = \sum_a \frac{\mathbf K \cdot \boldsymbol\varepsilon_{\nu,a}(\mathbf k)}
+            {\sqrt{2 M_a \omega_\nu(\mathbf k)}}\, e^{i \mathbf K \cdot \mathbf R_a},
+            \qquad S_\nu(\mathbf K) = |F_\nu(\mathbf K)|^2 ,
+
+        with the periodic (QuantumESPRESSO) polarization vectors. The interpolated modes
+        are in the atomic gauge, which differs from them by a phase exp(-i k.R_a), so the
+        phase becomes exp(-2 pi i Q.R_a) and S depends only on K, also when ``k`` leaves
+        the first Brillouin zone. See ``docs/dyn_matrix.md`` for the derivation and checks.
 
         Parameters
         ----------
@@ -475,7 +488,8 @@ class DynMatrix:
         N : int
             Number of intervals per segment (each segment has ``N + 1`` points).
         Q : array_like, [3]
-            Reciprocal lattice vector in fractional units, e.g. ``[0, 0, 3]``.
+            Reciprocal lattice vector in fractional units (integers), e.g. ``[0, 0, 3]``.
+            The path ``k`` may extend beyond the first zone, e.g. to ``[1, 0, 0]``.
 
         Returns
         -------
@@ -486,12 +500,16 @@ class DynMatrix:
         xticks : list of float
             Values of ``cart_qpath`` at the segment boundaries.
         structure_factor : np.ndarray, [Nsegments*(N+1), Natoms*3]
-            Structure factor of each mode.
+            S of each mode in arbitrary units: K in Angstrom^-1 (without 2 pi), masses in
+            Ry atomic units and frequencies in cm^-1. Zero for imaginary modes.
         """
         qpath, cart_qpath, xticks = self._build_qpath(k_inpath, N)
         directions = self._segment_directions(k_inpath, N)
         nmodes = self.structure.Natoms * 3
-        masses = self.structure.masses
+        Q = np.asarray(Q, dtype=float)
+        # exp(i K.R_a) on the periodic vectors = exp(-i Q.R_a) on the atomic-gauge ones.
+        Q_cart = _cell.cryst2cart(Q, self.structure.rcell)
+        weights = (np.exp(-2j * np.pi * (self.structure.atom_coords @ Q_cart)) / np.sqrt(2 * self.structure.masses))[None, :, None]
         bands = np.empty([len(qpath), nmodes], dtype=np.float64)
         structure_factor = np.empty([len(qpath), nmodes], dtype=np.float64)
         for qi, q in enumerate(qpath):
@@ -499,12 +517,9 @@ class DynMatrix:
             frequencies = _eigenvalues_to_cm(eigenvalues)
             bands[qi] = _signed_frequencies(frequencies)
 
-            displacements = np.reshape(polvecs / np.sqrt(_expanded_masses(masses)), [nmodes, -1, 3])
-            Qq_cart = _cell.cryst2cart(np.asarray(q + Q), self.structure.rcell)
-            phases = np.exp(2j * np.pi * (self.structure.atom_coords @ Qq_cart))
-            weights = (phases * np.sqrt(2 * masses))[None, :, None]
-            s = np.einsum("man,n->m", weights * displacements, Qq_cart)
-            structure_factor[qi] = np.real(np.conjugate(s) * s / frequencies)
+            K_cart = _cell.cryst2cart(q + Q, self.structure.rcell)
+            F = np.einsum("man,n->m", weights * np.reshape(polvecs, [nmodes, -1, 3]), K_cart)
+            structure_factor[qi] = np.real(np.abs(F) ** 2 / frequencies)
         return bands, cart_qpath, xticks, structure_factor
 
     def Symmetrize(self, symprec: float = 1e-5, apply_translations: bool = True) -> None:
@@ -718,7 +733,8 @@ class DynMatrix:
         )
         phiq = phiq + self._long_range(q, gauge)
         if direction is not None and _is_gamma(q):
-            phiq = phiq + self._nonanalytic(direction)
+            # Same gauge phase as the rest of Phi(q); it is 1 at q = 0 but not at q = G.
+            phiq = phiq + self._nonanalytic(direction) * self._gauge_phases(q, gauge)[:, :, None, None]
         eigenvalues, polvecs = _interpolation.diag_dynq(phiq, self.structure.masses)
         return phiq, eigenvalues, np.transpose(polvecs)
 
@@ -742,6 +758,13 @@ class DynMatrix:
         """Non-analytic force constants at Gamma along ``direction`` (fractional), [Natoms, Natoms, 3, 3] in Ry/bohr^2."""
         qhat = np.asarray(direction, dtype=float) @ self.structure.rcell
         return _interpolation.nonanalytic(qhat, self.epsilon, self.zeff, self._volume_bohr())
+
+    def _gauge_phases(self, q: np.ndarray, gauge: str) -> np.ndarray:
+        """[Natoms, Natoms] phases exp(2 pi i q.(tau_b - tau_a)) of the atomic gauge relative to the lattice one (ones for "lattice")."""
+        if gauge == "lattice":
+            return np.ones([self.structure.Natoms] * 2)
+        phases = np.exp(2j * np.pi * (self.structure.atom_coords @ (np.asarray(q, dtype=float) @ self.structure.rcell)))
+        return np.outer(phases.conj(), phases)
 
     def _volume_bohr(self) -> float:
         """Volume of the primitive cell in bohr^3."""

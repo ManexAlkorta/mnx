@@ -278,14 +278,46 @@ pairs give Q₋q = Q_q*.
 
 ### Structure factor (`get_bands_with_SF`)
 
-For **K** = **k** + **Q** in cartesian units (Å⁻¹ without 2π) and each mode,
+`get_bands_with_SF(k_inpath, N, Q)` evaluates the one-phonon structure factor at the total
+momentum transfer **K** = **Q** + **k**, with **Q** a reciprocal lattice vector and **k** running
+along the path. It is Eq. (2) of the Supplementary Information of A. Korshunov, M. Alkorta
+*et al.*, *Flat band driven competing charge and spin instabilities in the altermagnet CrSb*,
+arXiv:2603.25317 (after R. A. Cowley, Rep. Prog. Phys. **31**, 123 (1968), and A. Q. R. Baron,
+arXiv:1504.01098), with atomic form factors f_a = 1 and no Debye–Waller factor:
 
 $$
-S_\nu(\mathbf K) = \frac{1}{\omega_\nu}\left|\sum_a \sqrt{2 m_a}\; e^{2\pi i\, \mathbf K \cdot \mathbf r_a}\; \mathbf u_{\nu,a} \cdot \mathbf K\right|^2 ,
+F_\nu(\mathbf K) = \sum_a \frac{\mathbf K \cdot \boldsymbol\varepsilon_{\nu,a}(\mathbf k)}{\sqrt{2 M_a\, \omega_\nu(\mathbf k)}}\,
+e^{i \mathbf K \cdot \mathbf R_a},
+\qquad S_\nu(\mathbf K) = |F_\nu(\mathbf K)|^2 .
 $$
 
-with ω in cm⁻¹ and the atomic gauge. As implemented, √(2m_a)·**u**_a = √2·**e**_a, so the
-masses cancel. No scattering lengths or form factors are included.
+Here **ε**_ν(**k**) are the periodic polarization vectors of QuantumESPRESSO (lattice gauge,
+**ε**(**k** + **G**) = **ε**(**k**)) and **R**_a the positions in the primitive cell. With them
+*S* depends only on **K**. `mnx` interpolates in the atomic gauge, whose vectors differ by a phase,
+**ε**ᵃᵗᵒᵐⁱᶜ_a = e^{−i**k**·**R**_a} **ε**_a, so the code evaluates the same |F| as
+
+$$
+F_\nu(\mathbf K) = \sum_a \frac{\mathbf K \cdot \boldsymbol\varepsilon^{\,\mathrm{atomic}}_{\nu,a}(\mathbf k)}{\sqrt{2 M_a\, \omega_\nu(\mathbf k)}}\,
+e^{-2\pi i\, \mathbf Q \cdot \mathbf R_a}
+$$
+
+(fractional **Q**, cartesian **R**_a). Units are arbitrary: **K** in Å⁻¹ without 2π, M in Ry
+atomic units, ω in cm⁻¹. Imaginary modes get *S* = 0. With LO–TO splitting (`apply_nac`), Γ
+takes the direction of its segment, as in `get_bands`.
+
+Because *S* depends only on **K**, a path can leave the first Brillouin zone: Γ → M → Γ′ with
+**k** from (0, 0, 0) to (1, 0, 0) scans **K** from **Q** to **Q** + (1, 0, 0).
+
+`tests/test_structure_factor.py` checks this formula three ways: against Eq. (2) evaluated
+literally on the polarization vectors of the dyn files; that (**k**, **Q**) and
+(**k** − **G**, **Q** + **G**) give the same *S*; and, off the grid, against the real normal modes of
+4×1×1 and 1×1×3 supercells built from the same force constants, where no phase convention
+enters. In space-group-symmetric crystals *S*(**K**) = *S*(R**K**) also holds for every
+operation R (checked to 3·10⁻⁷ for CrSb and MnTe).
+
+Earlier versions of `get_bands_with_SF` used √(2M_a)·**u**_a (= √2·**ε**_a, without the
+1/√M_a of Eq. (2)) and the phase e^{2πi**K**·**R**_a} on the atomic-gauge vectors, which is not
+periodic in **k**. Structure factors computed with earlier versions are not comparable.
 
 ### Symmetrization (`Symmetrize`)
 
@@ -376,7 +408,9 @@ continuous with ω(Γ, **q̂**) (`test_loto_limit_is_continuous`).
    short-range part Φˢᴿ = Φ − Φᴸᴿ. `phiR` holds Φˢᴿ, which decays fast in real space.
 2. `get_dynq` / `get_bands` / `get_bands_with_SF` interpolate Φˢᴿ to **q** (Fortran
    `ft_phir`), add Φᴸᴿ(**q**) (Fortran `dipole_dipole`) and, at Γ (or any **G**) with a
-   direction, Φᴺᴬ(**q̂**) (Fortran `nonanalytic`), then diagonalize (`diag_dynq`).
+   direction, Φᴺᴬ(**q̂**) (Fortran `nonanalytic`), then diagonalize (`diag_dynq`). In the atomic
+   gauge Φᴺᴬ gets the same phase e^{2πi**q**·(**τ**_b − **τ**_a)} as the rest of Φ(**q**): it is 1 at **q** = 0
+   but not at **q** = **G**, e.g. at Γ′ = (1, 0, 0) of a path into the next zone.
 
 On the grid points this gives back the input dyn files exactly (`test_grid_points_reproduced`).
 `Symmetrize` symmetrizes Φˢᴿ and rebuilds the grid matrices with Φᴸᴿ added back.
@@ -473,6 +507,7 @@ The tests in [`tests/`](../tests) run on every pull request (`.github/workflows/
 | `test_loto.py::test_bands_match_quantum_espresso` | QE 6.7 `q2r.x` (`zasr='simple'`) + `matdyn.x` (`asr='no'`), MnTe 2×2×2 with LO–TO, 168 q-points with Γ reached along 4 directions (`tests/data/MnTe_2x2x2`) | < 1e-3 cm⁻¹ (max 1.1e-4) |
 | `test_loto.py::test_bands_match_cellconstructor` | CellConstructor `ForceTensor.Tensor2`, same path, `zasr="no"` (`tests/data/MnTe_2x2x2/make_cc_reference.py`) | < 1e-4 cm⁻¹ (max 7e-6) |
 | `test_loto.py` (other tests) | charges and ε∞ read and written back; charge sum rule; hexagonal `ibrav=4` cell; grid points reproduced with Φᴸᴿ in both gauges; analytic Γ = `ph.x`; Φᴺᴬ vs an independent NumPy formula; ω(**q** → 0) continuous; gauge phase of Φᴸᴿ; `apply_nac` switch | see the tests |
+| `test_structure_factor.py` | Eq. (2) of arXiv:2603.25317 on the dyn-file polarization vectors; invariance under (**k**, **Q**) → (**k** − **G**, **Q** + **G**); real-space 4×1×1 and 1×1×3 supercells off the grid | < 1e-6 (grid), < 1e-9 |
 | `test_io.py` | `mnx.io` with real and synthetic bands | exact |
 | `test_projection.py` | `distort_structure` → shuffle atoms → `project_structure` returns the input Q; modes orthonormal; integer characters; errors | < 1e-9 |
 

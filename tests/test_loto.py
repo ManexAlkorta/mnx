@@ -199,3 +199,18 @@ def test_symmetrize_keeps_loto(mnte):
         )
     for dynq, original in zip(dyn.DynQs, mnte.DynQs):
         np.testing.assert_allclose(dynq.phiqs, original.phiqs, atol=1e-6)
+
+
+@pytest.mark.parametrize("gauge", ["atomic", "lattice"])
+@pytest.mark.parametrize("G", [[1, 0, 0], [0, 1, -1], [2, -1, 3]])
+def test_loto_at_equivalent_gamma(mnte, G, gauge):
+    """A Gamma point outside the first zone (q = G) has the same LO-TO splitting as q = 0."""
+    for direction in [[1, 0, 0], [0, 0, 1], [1, 1, 1]]:
+        np.testing.assert_allclose(
+            mnte.get_dynq(G, gauge=gauge, direction=direction).frequencies[0].real,
+            mnte.get_dynq([0, 0, 0], gauge=gauge, direction=direction).frequencies[0].real,
+            atol=1e-8,
+        )
+    # Gamma -> M -> Gamma' is mirror symmetric, also at its end points.
+    bands, _, _ = mnte.get_bands([[[0, 0, 0], [0.5, 0, 0]], [[0.5, 0, 0], [1, 0, 0]]], 10, gauge=gauge)
+    np.testing.assert_allclose(bands[:11], bands[11:][::-1], atol=1e-8)
