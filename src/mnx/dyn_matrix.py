@@ -554,7 +554,39 @@ class DynMatrix:
             symph.trans_v2(fc, self._QE_translations_irt)
         symph.sym_v2(fc, self._QE_at, self._QE_bg, self._QE_s, self._QE_irt, self._QE_nsym)
         self.phiR[...] = fc.transpose(2, 3, 0, 1)
+        self._update_dynqs_from_phiR()
 
+    def apply_asr(self, asr: str = "simple") -> None:
+        r"""
+        Impose the acoustic sum rule on the force constants.
+
+        A rigid translation of the crystal costs no energy, so
+        :math:`\sum_B \Phi_{AB}^{\alpha\beta} = 0` for every atom A, and the three acoustic
+        modes vanish at Gamma. DFPT force constants break it slightly (MnTe: 2.9 and
+        7.2 cm^-1 at Gamma). As ``asr='simple'`` of QuantumESPRESSO's matdyn.x, the
+        violation of each row is removed from the on-site term:
+
+        .. math:: \Phi_{AA}^{\alpha\beta} \leftarrow \Phi_{AA}^{\alpha\beta} - \sum_B \Phi_{AB}^{\alpha\beta} .
+
+        It acts on ``phiR`` (the short-range part when ``apply_nac`` is on, as in
+        matdyn.x; the long-range term satisfies the rule by construction). The dynamical
+        matrices and modes of every q-star are then recomputed from it, so ``write``,
+        ``apply_nac`` and the grid modes keep the correction. The on-site change shifts
+        Phi(q) at every q, so optical frequencies change slightly too.
+
+        Parameters
+        ----------
+        asr : {"simple"}, optional
+            Sum rule to impose. Only ``"simple"`` is implemented.
+        """
+        if asr != "simple":
+            raise ValueError(f"Unknown asr '{asr}', only 'simple' is implemented")
+        atoms = np.arange(self.phiR.shape[0])
+        self.phiR[atoms, atoms] -= self.phiR.sum(axis=1)
+        self._update_dynqs_from_phiR()
+
+    def _update_dynqs_from_phiR(self) -> None:
+        """Recompute the force constants and modes of every q-star of the grid from ``phiR``."""
         for si, star in enumerate(self.qstars):
             dynq = self.DynQs[si]
             for qi, q in enumerate(star):

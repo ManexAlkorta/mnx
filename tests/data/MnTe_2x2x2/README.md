@@ -12,6 +12,7 @@ along x (Γ–M), along K–Γ, along z (Γ–A) and along L–Γ.
 |---|---|
 | `q2r.in`, `matdyn.in` | QuantumESPRESSO 6.7 inputs: `zasr='simple'`, `asr='no'`, explicit q-list in crystal coordinates |
 | `freq` | `matdyn.x` output (`flfrq`), cm⁻¹ with 4 decimals |
+| `matdyn_asr_simple.in`, `freq_asr_simple` | same with the acoustic sum rule `asr='simple'` (`tests/test_asr.py`) |
 | `make_cc_reference.py` | script that writes `cc_freq.txt` with CellConstructor's `ForceTensor.Tensor2` |
 | `cc_freq.txt` | CellConstructor frequencies, charges without sum rule (`zasr="no"` in mnx) |
 
@@ -20,6 +21,7 @@ To regenerate the QuantumESPRESSO reference, copy `Tutorial/dyns/MnTe/dyn0 ... d
 ```bash
 q2r.x < q2r.in > q2r.out
 matdyn.x < matdyn.in > matdyn.out
+matdyn.x < matdyn_asr_simple.in > matdyn_asr_simple.out
 ```
 
 `matdyn.x` takes the LO–TO direction at q = 0 from the previous point of the list, or from the

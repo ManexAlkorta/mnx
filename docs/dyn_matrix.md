@@ -85,6 +85,7 @@ names below.
 | `distort_structure(Q, modes, mod)` | supercell displaced along a combination of modes |
 | `project_structure(structure, modes, cutoff)` | amplitudes Q of the selected modes in a structure (inverse of `distort_structure`) |
 | `Symmetrize(symprec)` | symmetrizes structure and force constants |
+| `apply_asr(asr)` | imposes the acoustic sum rule (`"simple"`, as `matdyn.x`) |
 | `get_Pmn(symprec)` | little-group representation matrices of every star |
 | `write(prefix)` / `to_CC()` | QE dyn files / CellConstructor `Phonons` |
 | `change_cell(cell)`, `copy()`, `info()` | utilities |
@@ -329,6 +330,37 @@ periodic in **k**. Structure factors computed with earlier versions are not comp
 4. Φ(**q**), frequencies and eigenvectors of every star are recomputed from the
    symmetrized Φ_AB (lattice gauge).
 
+### Acoustic sum rule (`apply_asr`)
+
+A rigid translation of the crystal costs no energy, so for every atom A of the supercell
+
+$$
+\sum_B \Phi_{AB}^{\alpha\beta} = 0 ,
+$$
+
+and the three acoustic modes vanish at Γ. DFPT force constants break this slightly
+(finite k-point sampling, real-space grid, thresholds); MnTe's `dyn1` has acoustic modes at
+2.9, 2.9 and 7.2 cm⁻¹. `dyn.apply_asr("simple")` does what `asr = 'simple'` does in
+QuantumESPRESSO's `matdyn.x`: the violation of each row goes into the on-site term,
+
+$$
+\Phi_{AA}^{\alpha\beta} \leftarrow \Phi_{AA}^{\alpha\beta} - \sum_B \Phi_{AB}^{\alpha\beta} .
+$$
+
+- It acts on the real-space `phiR`, because the rule is a real-space condition. The on-site
+  change is the same at every **q**, so Φ(**q**) changes on the whole grid, not only at Γ, and
+  optical frequencies shift a little too (MnTe: 93.209 → 93.159 cm⁻¹ at Γ, as in `matdyn.x`).
+- With `apply_nac` it acts on the short-range part, as `matdyn.x` does; the long-range term
+  satisfies the rule by construction.
+- Φ(**q**) and the modes of every star are then recomputed from `phiR` (as in `Symmetrize`),
+  so the grid modes (`distort_structure`, `get_Pmn`…), `write()` and switching `apply_nac`
+  keep the correction.
+- It is not applied by default, as `asr = 'no'` is the default of `matdyn.x`. To compare
+  with `matdyn.x`, use the same setting in both.
+
+QuantumESPRESSO's `asr = 'crystal'` (an optimal projection that also keeps the index
+symmetry of Φ) is not implemented.
+
 ### Little-group representations (`get_Pmn`, `compute_traces`)
 
 For every star, using its first q-point expanded to the q-grid supercell, and every
@@ -507,6 +539,8 @@ The tests in [`tests/`](../tests) run on every pull request (`.github/workflows/
 | `test_loto.py::test_bands_match_quantum_espresso` | QE 6.7 `q2r.x` (`zasr='simple'`) + `matdyn.x` (`asr='no'`), MnTe 2×2×2 with LO–TO, 168 q-points with Γ reached along 4 directions (`tests/data/MnTe_2x2x2`) | < 1e-3 cm⁻¹ (max 1.1e-4) |
 | `test_loto.py::test_bands_match_cellconstructor` | CellConstructor `ForceTensor.Tensor2`, same path, `zasr="no"` (`tests/data/MnTe_2x2x2/make_cc_reference.py`) | < 1e-4 cm⁻¹ (max 7e-6) |
 | `test_loto.py` (other tests) | charges and ε∞ read and written back; charge sum rule; hexagonal `ibrav=4` cell; grid points reproduced with Φᴸᴿ in both gauges; analytic Γ = `ph.x`; Φᴺᴬ vs an independent NumPy formula; ω(**q** → 0) continuous; gauge phase of Φᴸᴿ; `apply_nac` switch | see the tests |
+| `test_asr.py::test_bands_match_quantum_espresso` | QE 6.7 `matdyn.x` with `asr='no'` and `asr='simple'`, CrSb and MnTe (with LO–TO) 2×2×2, same 168 q-points (`tests/data/CrSb_2x2x2`, `tests/data/MnTe_2x2x2`) | < 1e-3 cm⁻¹ (max 1.4e-4) |
+| `test_asr.py` (other tests) | acoustic modes 0 at Γ (also with LO–TO); Σ_B Φ_AB = 0; kept by `write`/`from_file`, `apply_nac` and the grid modes | < 1e-3 cm⁻¹ |
 | `test_structure_factor.py` | Eq. (2) of arXiv:2603.25317 on the dyn-file polarization vectors; invariance under (**k**, **Q**) → (**k** − **G**, **Q** + **G**); real-space 4×1×1 and 1×1×3 supercells off the grid | < 1e-6 (grid), < 1e-9 |
 | `test_io.py` | `mnx.io` with real and synthetic bands | exact |
 | `test_projection.py` | `distort_structure` → shuffle atoms → `project_structure` returns the input Q; modes orthonormal; integer characters; errors | < 1e-9 |
@@ -515,8 +549,9 @@ Run them locally from the repository root with `python -m pytest -v`.
 
 ## Known limitations
 
-- **No acoustic sum rule** is imposed on Φ, so acoustic modes at Γ are not exactly zero
-  (MnTe: 2.9 and 7.2 cm⁻¹). Compare with `matdyn.x` using `asr='no'`.
+- **Acoustic sum rule**: only `apply_asr("simple")`; QE's `asr = 'crystal'` is not
+  implemented. Without it, acoustic modes at Γ are not exactly zero (MnTe: 2.9 and
+  7.2 cm⁻¹).
 - **LO–TO splitting, 3D only**: no 2D Coulomb cutoff (QE's `loto_2d`) for layers in vacuum.
 - **Effective charges are not symmetrized**: `Symmetrize` acts on Φˢᴿ only; ε∞ and Z* are
   used as read (plus the charge sum rule).
