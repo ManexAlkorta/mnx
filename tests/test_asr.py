@@ -80,3 +80,16 @@ def test_grid_modes_updated(mnte):
 def test_unknown_rule(crsb):
     with pytest.raises(ValueError):
         crsb.copy().apply_asr("crystal")
+
+
+def test_refuses_large_corrections(mnte):
+    """MnTe needs a correction of 0.85% of the largest on-site force constant."""
+    dyn = mnte.copy()
+    phiR = dyn.phiR.copy()
+    frequencies = dyn.DynQs[0].frequencies.copy()
+    with pytest.raises(ValueError, match="might alter the physics"):
+        dyn.apply_asr("simple", tol=5e-3)
+    np.testing.assert_array_equal(dyn.phiR, phiR)  # left unchanged
+    np.testing.assert_array_equal(dyn.DynQs[0].frequencies, frequencies)
+    dyn.apply_asr("simple", tol=1e-2)
+    np.testing.assert_allclose(_acoustic_at_gamma(dyn), 0, atol=1e-3)

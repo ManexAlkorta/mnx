@@ -85,7 +85,7 @@ names below.
 | `distort_structure(Q, modes, mod)` | supercell displaced along a combination of modes |
 | `project_structure(structure, modes, cutoff)` | amplitudes Q of the selected modes in a structure (inverse of `distort_structure`) |
 | `Symmetrize(symprec)` | symmetrizes structure and force constants |
-| `apply_asr(asr)` | imposes the acoustic sum rule (`"simple"`, as `matdyn.x`) |
+| `apply_asr(asr, tol)` | imposes the acoustic sum rule (`"simple"`, as `matdyn.x`); refuses corrections larger than `tol` |
 | `get_Pmn(symprec)` | little-group representation matrices of every star |
 | `write(prefix)` / `to_CC()` | QE dyn files / CellConstructor `Phonons` |
 | `change_cell(cell)`, `copy()`, `info()` | utilities |
@@ -357,6 +357,11 @@ $$
   keep the correction.
 - It is not applied by default, as `asr = 'no'` is the default of `matdyn.x`. To compare
   with `matdyn.x`, use the same setting in both.
+- A large violation usually means an unconverged or inconsistent calculation, which the
+  sum rule would only hide. The correction is refused with a `ValueError`, leaving the
+  object unchanged, when max_A \|Σ_B Φ_AB\| / max_A \|Φ_AA\| > `tol` (default 0.05). The
+  message gives the size of the correction and the acoustic frequencies at Γ. MnTe needs
+  0.0085, CrSb 10⁻⁷.
 
 QuantumESPRESSO's `asr = 'crystal'` (an optimal projection that also keeps the index
 symmetry of Φ) is not implemented.
@@ -540,7 +545,7 @@ The tests in [`tests/`](../tests) run on every pull request (`.github/workflows/
 | `test_loto.py::test_bands_match_cellconstructor` | CellConstructor `ForceTensor.Tensor2`, same path, `zasr="no"` (`tests/data/MnTe_2x2x2/make_cc_reference.py`) | < 1e-4 cm⁻¹ (max 7e-6) |
 | `test_loto.py` (other tests) | charges and ε∞ read and written back; charge sum rule; hexagonal `ibrav=4` cell; grid points reproduced with Φᴸᴿ in both gauges; analytic Γ = `ph.x`; Φᴺᴬ vs an independent NumPy formula; ω(**q** → 0) continuous; gauge phase of Φᴸᴿ; `apply_nac` switch | see the tests |
 | `test_asr.py::test_bands_match_quantum_espresso` | QE 6.7 `matdyn.x` with `asr='no'` and `asr='simple'`, CrSb and MnTe (with LO–TO) 2×2×2, same 168 q-points (`tests/data/CrSb_2x2x2`, `tests/data/MnTe_2x2x2`) | < 1e-3 cm⁻¹ (max 1.4e-4) |
-| `test_asr.py` (other tests) | acoustic modes 0 at Γ (also with LO–TO); Σ_B Φ_AB = 0; kept by `write`/`from_file`, `apply_nac` and the grid modes | < 1e-3 cm⁻¹ |
+| `test_asr.py` (other tests) | acoustic modes 0 at Γ (also with LO–TO); Σ_B Φ_AB = 0; kept by `write`/`from_file`, `apply_nac` and the grid modes; corrections above `tol` refused without changes | < 1e-3 cm⁻¹ |
 | `test_structure_factor.py` | Eq. (2) of arXiv:2603.25317 on the dyn-file polarization vectors; invariance under (**k**, **Q**) → (**k** − **G**, **Q** + **G**); real-space 4×1×1 and 1×1×3 supercells off the grid | < 1e-6 (grid), < 1e-9 |
 | `test_io.py` | `mnx.io` with real and synthetic bands | exact |
 | `test_projection.py` | `distort_structure` → shuffle atoms → `project_structure` returns the input Q; modes orthonormal; integer characters; errors | < 1e-9 |

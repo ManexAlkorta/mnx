@@ -556,7 +556,7 @@ class DynMatrix:
         self.phiR[...] = fc.transpose(2, 3, 0, 1)
         self._update_dynqs_from_phiR()
 
-    def apply_asr(self, asr: str = "simple") -> None:
+    def apply_asr(self, asr: str = "simple", tol: float = 0.05) -> None:
         r"""
         Impose the acoustic sum rule on the force constants.
 
@@ -574,15 +574,38 @@ class DynMatrix:
         ``apply_nac`` and the grid modes keep the correction. The on-site change shifts
         Phi(q) at every q, so optical frequencies change slightly too.
 
+        It is never applied by default. A large violation usually signals an unconverged
+        or inconsistent calculation that the sum rule would only hide, so the correction
+        is refused when it exceeds ``tol`` times the largest on-site force constant; the
+        object is then left unchanged.
+
         Parameters
         ----------
         asr : {"simple"}, optional
             Sum rule to impose. Only ``"simple"`` is implemented.
+        tol : float, optional
+            Largest accepted correction, max_A |sum_B Phi_AB| / max_A |Phi_AA|.
+            Defaults to 0.05 (MnTe needs 0.0085).
+
+        Raises
+        ------
+        ValueError
+            If the correction is larger than ``tol``.
         """
         if asr != "simple":
             raise ValueError(f"Unknown asr '{asr}', only 'simple' is implemented")
         atoms = np.arange(self.phiR.shape[0])
-        self.phiR[atoms, atoms] -= self.phiR.sum(axis=1)
+        correction = self.phiR.sum(axis=1)
+        relative = np.abs(correction).max() / np.abs(self.phiR[atoms, atoms]).max()
+        if relative > tol:
+            _, eigenvalues, _ = self._interpolate(np.zeros(3), "lattice")
+            acoustic = _signed_frequencies(_eigenvalues_to_cm(eigenvalues))[:3]
+            raise ValueError(
+                f"The acoustic sum rule correction is {relative:.1%} of the largest on-site force constant "
+                f"(tol = {tol:.1%}); the acoustic modes at Gamma are {np.round(acoustic, 2)} cm^-1. Imposing it "
+                "might alter the physics: check the convergence of the calculation, or pass a larger tol."
+            )
+        self.phiR[atoms, atoms] -= correction
         self._update_dynqs_from_phiR()
 
     def _update_dynqs_from_phiR(self) -> None:
